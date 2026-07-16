@@ -1,27 +1,62 @@
 # Force bash pour executer les recettes, peu importe le terminal depuis
-# lequel `make` est lance (PowerShell/cmd utiliseraient sinon cmd.exe, qui
-# ne comprend pas la syntaxe bash utilisee ici : until/done, /dev/null...).
+# lequel `make` est lance.
 SHELL := bash.exe
 
 GROUPE ?= grp01
 KAFKA_BOOTSTRAP ?= localhost:29092
+
+# Nombre maximal de messages par fichier.
+# Vide = aucune limite.
 LIMIT ?=
 
-.PHONY: help up wait-kafka topics init run load reset down status dlq confirmed
+# Configuration du mode streaming.
+BATCH_SIZE ?= 10
+INTERVAL_MS ?= 1000
+
+.PHONY: help up wait-kafka topics init run load stream reset down status dlq confirmed
 
 help:
 	@echo "Cibles disponibles :"
-	@echo "  make init              - cluster Docker + attente + creation des topics"
-	@echo "  make up                - demarre Kafka et Kafbat UI"
-	@echo "  make run [GROUPE=xxx]  - lance l'application Spring Boot"
-	@echo "  make load              - charge toutes les donnees"
-	@echo "  make load LIMIT=500    - charge au plus 500 lignes par fichier"
-	@echo "  make status            - affiche les containers et le lag"
-	@echo "  make dlq               - affiche le contenu du DLQ"
-	@echo "  make confirmed         - affiche le contenu de orders.confirmed (CART-2)"
-	@echo "  make reset             - supprime le cluster et nettoie target"
+	@echo ""
+	@echo "  make init"
+	@echo "      Demarre Kafka et cree les topics."
+	@echo ""
+	@echo "  make up"
+	@echo "      Demarre Kafka et Kafbat UI."
+	@echo ""
+	@echo "  make run [GROUPE=xxx]"
+	@echo "      Lance l'application Spring Boot."
+	@echo ""
+	@echo "  make load"
+	@echo "      Envoie immediatement toutes les donnees."
+	@echo ""
+	@echo "  make load LIMIT=500"
+	@echo "      Envoie au plus 500 lignes par fichier."
+	@echo ""
+	@echo "  make stream"
+	@echo "      Envoie les donnees par batch de 10 toutes les 1000 ms."
+	@echo ""
+	@echo "  make stream BATCH_SIZE=5 INTERVAL_MS=2000"
+	@echo "      Envoie les donnees par batch de 5 toutes les 2 secondes."
+	@echo ""
+	@echo "  make stream BATCH_SIZE=5 INTERVAL_MS=2000 LIMIT=500"
+	@echo "      Mode streaming limite a 500 lignes par fichier."
+	@echo ""
+	@echo "  make status"
+	@echo "      Affiche les containers et le lag Kafka Streams."
+	@echo ""
+	@echo "  make dlq"
+	@echo "      Affiche les 20 premiers messages du DLQ."
+	@echo ""
+	@echo "  make confirmed"
+	@echo "      Affiche les 20 premiers messages de orders.confirmed."
+	@echo ""
+	@echo "  make reset"
+	@echo "      Supprime le cluster, les volumes et le dossier target."
 
-## --- Demarrage ---
+## ---------------------------------------------------------------------------
+## Demarrage du cluster
+## ---------------------------------------------------------------------------
 
 up:
 	docker compose up -d
@@ -38,25 +73,57 @@ wait-kafka:
 
 topics:
 	GROUPE=$(GROUPE) KAFKA_BOOTSTRAP=$(KAFKA_BOOTSTRAP) \
-		mvn -q compile exec:java -Dexec.args="--topics-only"
+		mvn -q compile exec:java \
+		-Dexec.args="--topics-only"
 
 init: up wait-kafka topics
 	@echo ""
-	@echo "Init terminee."
-	@echo "Etape suivante : make run, puis make load dans un autre terminal."
+	@echo "Initialisation terminee."
+	@echo "Etapes suivantes :"
+	@echo "  1. make run"
+	@echo "  2. make load ou make stream dans un autre terminal"
 
-## --- Application et donnees ---
+## ---------------------------------------------------------------------------
+## Application Spring Boot
+## ---------------------------------------------------------------------------
 
 run:
 	GROUPE=$(GROUPE) KAFKA_BOOTSTRAP=$(KAFKA_BOOTSTRAP) \
 		mvn spring-boot:run
 
+## ---------------------------------------------------------------------------
+## Chargement immediat
+## ---------------------------------------------------------------------------
+
+# Tout envoyer :
+#   make load
+#
+# Limiter le nombre de messages par fichier :
+#   make load LIMIT=500
 load:
 	GROUPE=$(GROUPE) KAFKA_BOOTSTRAP=$(KAFKA_BOOTSTRAP) \
 		mvn -q compile exec:java \
 		$(if $(LIMIT),-Dexec.args="--limit $(LIMIT)",)
 
-## --- Observabilite ---
+## ---------------------------------------------------------------------------
+## Simulation streaming
+## ---------------------------------------------------------------------------
+
+# Exemples :
+#
+#   make stream
+#   make stream BATCH_SIZE=5 INTERVAL_MS=2000
+#   make stream BATCH_SIZE=5 INTERVAL_MS=2000 LIMIT=500
+#
+# --live-timestamps utilise l'heure actuelle comme timestamp Kafka.
+stream:
+	GROUPE=$(GROUPE) KAFKA_BOOTSTRAP=$(KAFKA_BOOTSTRAP) \
+		mvn -q compile exec:java \
+		-Dexec.args="--batch-size $(BATCH_SIZE) --interval-ms $(INTERVAL_MS) --live-timestamps $(if $(LIMIT),--limit $(LIMIT),)"
+
+## ---------------------------------------------------------------------------
+## Observabilite
+## ---------------------------------------------------------------------------
 
 status:
 	@echo "=== Containers Docker ==="
@@ -67,10 +134,11 @@ status:
 		/opt/kafka/bin/kafka-consumer-groups.sh \
 		--bootstrap-server localhost:9092 \
 		--describe \
-		--group cartflow-$(GROUPE) 2>&1 | grep -v "^Note:" || true
+		--group cartflow-$(GROUPE) 2>&1 | \
+		grep -v "^Note:" || true
 
 dlq:
-	@echo "(20 premiers messages max - le topic peut en contenir bien plus, voir 'make status')"
+	@echo "(20 premiers messages max - le topic peut en contenir davantage)"
 	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
 		/opt/kafka/bin/kafka-console-consumer.sh \
 		--bootstrap-server localhost:9092 \
@@ -78,10 +146,11 @@ dlq:
 		--from-beginning \
 		--max-messages 20 \
 		--timeout-ms 15000 \
-		--property print.key=true 2>&1 | grep -v "^\["
+		--property print.key=true 2>&1 | \
+		grep -v "^\["
 
 confirmed:
-	@echo "(20 premiers messages max - le topic peut en contenir bien plus, voir 'make status')"
+	@echo "(20 premiers messages max - le topic peut en contenir davantage)"
 	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
 		/opt/kafka/bin/kafka-console-consumer.sh \
 		--bootstrap-server localhost:9092 \
@@ -89,9 +158,12 @@ confirmed:
 		--from-beginning \
 		--max-messages 20 \
 		--timeout-ms 15000 \
-		--property print.key=true 2>&1 | grep -v "^\["
+		--property print.key=true 2>&1 | \
+		grep -v "^\["
 
-## --- Nettoyage ---
+## ---------------------------------------------------------------------------
+## Nettoyage
+## ---------------------------------------------------------------------------
 
 down:
 	docker compose down
