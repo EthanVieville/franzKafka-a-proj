@@ -15,6 +15,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -45,7 +46,7 @@ public final class DataLoader {
     }
 
     public static void main(String[] args) throws Exception {
-        int limit = parseLimit(args);
+        Integer limit = parseLimit(args);
         String bootstrap = System.getenv().getOrDefault("KAFKA_BOOTSTRAP", "localhost:29092");
 
         createMissingTopics(bootstrap);
@@ -67,10 +68,15 @@ public final class DataLoader {
         Properties adminProps = new Properties();
         adminProps.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
 
+        // Source topics ET la DLQ : on ne compte pas sur l'auto-creation du
+        // broker au premier produce (source de flakiness au demarrage, deja
+        // observee avec MissingSourceTopicException sur les topics d'entree).
+        Set<String> wantedTopics = new HashSet<>(FILE_TO_TOPIC.values());
+        wantedTopics.add(Topics.DLQ);
+
         try (AdminClient admin = AdminClient.create(adminProps)) {
             Set<String> existing = admin.listTopics().names().get();
-            List<NewTopic> missing = FILE_TO_TOPIC.values().stream()
-                    .distinct()
+            List<NewTopic> missing = wantedTopics.stream()
                     .filter(topic -> !existing.contains(topic))
                     .map(topic -> new NewTopic(topic, PARTITIONS, REPLICATION_FACTOR))
                     .toList();
@@ -84,12 +90,12 @@ public final class DataLoader {
     }
 
     /** Une ligne source = {"key": ..., "value": "<json ou texte brut>", "ts_ms": ...}. */
-    private static long replay(KafkaProducer<String, String> producer, Path file, String topic, int limit)
+    private static long replay(KafkaProducer<String, String> producer, Path file, String topic, Integer limit)
             throws IOException {
         long count = 0;
         try (BufferedReader reader = Files.newBufferedReader(file)) {
             String line;
-            while ((line = reader.readLine()) != null && (limit <= 0 || count < limit)) {
+            while ((limit == null || count < limit) && (line = reader.readLine()) != null) {
                 if (line.isBlank()) {
                     continue;
                 }
@@ -102,13 +108,14 @@ public final class DataLoader {
         return count;
     }
 
-    private static int parseLimit(String[] args) {
+    /** null = pas de limite (tout envoyer) ; --limit 0 = aucun message (utile pour ne faire que creer les topics). */
+    private static Integer parseLimit(String[] args) {
         for (int i = 0; i < args.length - 1; i++) {
             if ("--limit".equals(args[i])) {
                 return Integer.parseInt(args[i + 1]);
             }
         }
-        return -1;
+        return null;
     }
 
     private record RawEnvelope(

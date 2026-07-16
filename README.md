@@ -204,6 +204,22 @@ exemples JSON ci-dessus à la main (pour CART-2, produisez la commande puis le
 paiement avec le même `order_id`). Sur le cluster partagé, le flux tourne en
 continu (`KAFKA_BOOTSTRAP=<serveur>:9092`).
 
+### Makefile (raccourcis de dev)
+
+Regroupe les commandes ci-dessus + le chargement des échantillons
+`data/raw/*.jsonl` (voir `src/main/java/.../tools/DataLoader.java`).
+
+| Commande | Effet |
+|---|---|
+| `make init` | 1ère fois : démarre Docker, attend que Kafka réponde, crée les topics (source + DLQ) |
+| `make up` | Démarre juste le cluster Docker (Kafka + Kafbat UI) |
+| `make run` / `make run GROUPE=grp02` | Lance l'application Spring Boot (`grp01` par défaut) |
+| `make load` | Envoie `data/raw/*.jsonl` en entier sur les topics source |
+| `make load LIMIT=500` | N'envoie que les 500 premières lignes de chaque fichier |
+| `make status` | État des containers Docker + lag du consumer group |
+| `make dlq` | Affiche le contenu de `<GROUPE>.cartflow.dlq` |
+| `make reset` | `docker compose down` (supprime le cluster **et** son contenu, pas de volume persistant) + `mvn clean` |
+
 ## Contraintes
 
 - Java 21, Spring Boot + Kafka Streams uniquement (pas de Spark/Flink, pas de
