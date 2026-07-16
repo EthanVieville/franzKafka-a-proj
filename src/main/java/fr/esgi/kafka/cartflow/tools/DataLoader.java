@@ -15,39 +15,51 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 
 /**
- * Outil de développement, hors du contexte Spring.
+ * Outil de développement hors du contexte Spring.
  *
- * Il permet :
- * - de créer les topics sources et le DLQ ;
- * - de rejouer les fichiers data/raw/*.jsonl ;
- * - de limiter le nombre de messages envoyés ;
- * - de créer uniquement les topics avec --topics-only.
+ * Modes disponibles :
  *
- * Exemples :
+ * 1. Envoi immédiat de toutes les données :
+ *    mvn compile exec:java
  *
- * mvn compile exec:java
- * mvn compile exec:java -Dexec.args="--limit 500"
- * mvn compile exec:java -Dexec.args="--limit 0"
- * mvn compile exec:java -Dexec.args="--topics-only"
+ * 2. Envoi immédiat avec une limite par fichier :
+ *    mvn compile exec:java -Dexec.args="--limit 500"
+ *
+ * 3. Envoi en streaming sur les trois topics :
+ *    mvn compile exec:java \
+ *      -Dexec.args="--batch-size 10 --interval-ms 1000 --live-timestamps"
+ *
+ * 4. Création des topics uniquement :
+ *    mvn compile exec:java -Dexec.args="--topics-only"
  */
 public final class DataLoader {
 
-    private static final Map<String, String> FILE_TO_TOPIC = Map.of(
-            "data/raw/cartflow.orders.jsonl",
-            Topics.ORDERS,
-
-            "data/raw/cartflow.payments.jsonl",
-            Topics.PAYMENTS,
-
-            "data/raw/cartflow.stock.movements.jsonl",
-            Topics.STOCK_MOVEMENTS
+    /**
+     * Liste ordonnée des fichiers et de leurs topics.
+     *
+     * En mode streaming, un batch sera envoyé sur chaque source
+     * dans cet ordre avant la pause.
+     */
+    private static final List<SourceDefinition> SOURCES = List.of(
+            new SourceDefinition(
+                    Path.of("data/raw/cartflow.orders.jsonl"),
+                    Topics.ORDERS
+            ),
+            new SourceDefinition(
+                    Path.of("data/raw/cartflow.payments.jsonl"),
+                    Topics.PAYMENTS
+            ),
+            new SourceDefinition(
+                    Path.of("data/raw/cartflow.stock.movements.jsonl"),
+                    Topics.STOCK_MOVEMENTS
+            )
     );
 
     private static final int PARTITIONS = 3;
@@ -60,7 +72,7 @@ public final class DataLoader {
     }
 
     public static void main(String[] args) throws Exception {
-        boolean topicsOnly = List.of(args).contains("--topics-only");
+        LoaderOptions options = parseOptions(args);
 
         String bootstrap = System.getenv()
                 .getOrDefault(
@@ -68,55 +80,72 @@ public final class DataLoader {
                         "localhost:29092"
                 );
 
-        System.out.println("Bootstrap Kafka : " + bootstrap);
-        System.out.println("Groupe           : " + Topics.GROUPE);
-        System.out.println("DLQ              : " + Topics.DLQ);
+        printConfiguration(bootstrap, options);
 
         createMissingTopics(bootstrap);
 
-        if (topicsOnly) {
+        if (options.topicsOnly()) {
             System.out.println(
                     "Creation des topics terminee. Aucun message envoye."
             );
             return;
         }
 
-        /*
-         * null signifie qu'aucune limite n'est appliquée.
-         *
-         * Il faut conserver le type Integer et non int, car parseLimit()
-         * peut retourner null.
-         */
-        Integer limit = parseLimit(args);
-
-        Properties producerProps = createProducerProperties(bootstrap);
+        Properties producerProperties =
+                createProducerProperties(bootstrap);
 
         try (KafkaProducer<String, String> producer =
-                     new KafkaProducer<>(producerProps)) {
+                     new KafkaProducer<>(producerProperties)) {
 
-            for (Map.Entry<String, String> entry
-                    : FILE_TO_TOPIC.entrySet()) {
-
-                Path file = Path.of(entry.getKey());
-                String topic = entry.getValue();
-
-                long count = replay(
-                        producer,
-                        file,
-                        topic,
-                        limit
-                );
-
-                System.out.printf(
-                        "%s -> %s : %d messages envoyes%n",
-                        file,
-                        topic,
-                        count
-                );
+            if (options.batchSize() > 0) {
+                replayStreaming(producer, options);
+            } else {
+                replayImmediate(producer, options);
             }
         }
 
         System.out.println("Chargement des donnees termine.");
+    }
+
+    private static void printConfiguration(
+            String bootstrap,
+            LoaderOptions options
+    ) {
+        System.out.println("Bootstrap Kafka : " + bootstrap);
+        System.out.println("Groupe           : " + Topics.GROUPE);
+        System.out.println("DLQ              : " + Topics.DLQ);
+
+        if (options.topicsOnly()) {
+            System.out.println("Mode             : creation des topics");
+            return;
+        }
+
+        if (options.batchSize() > 0) {
+            System.out.println("Mode             : streaming");
+            System.out.println(
+                    "Batch/topic       : " + options.batchSize()
+            );
+            System.out.println(
+                    "Intervalle        : "
+                            + options.intervalMs()
+                            + " ms"
+            );
+            System.out.println(
+                    "Timestamps live   : "
+                            + options.liveTimestamps()
+            );
+        } else if (options.limit() != null) {
+            System.out.println("Mode             : envoi limite");
+        } else {
+            System.out.println("Mode             : envoi complet");
+        }
+
+        System.out.println(
+                "Limite/fichier    : "
+                        + (options.limit() == null
+                        ? "aucune"
+                        : options.limit())
+        );
     }
 
     private static Properties createProducerProperties(
@@ -145,30 +174,30 @@ public final class DataLoader {
     private static void createMissingTopics(
             String bootstrap
     ) throws Exception {
-        Properties adminProps = new Properties();
+        Properties adminProperties = new Properties();
 
-        adminProps.put(
+        adminProperties.put(
                 AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
                 bootstrap
         );
 
-        /*
-         * Création des trois topics sources et du DLQ.
-         *
-         * Le DLQ est créé explicitement pour ne pas dépendre de
-         * l'auto-création Kafka au premier message invalide.
-         */
-        Set<String> wantedTopics =
-                new HashSet<>(FILE_TO_TOPIC.values());
+        Set<String> wantedTopics = new HashSet<>();
+
+        for (SourceDefinition source : SOURCES) {
+            wantedTopics.add(source.topic());
+        }
 
         wantedTopics.add(Topics.DLQ);
 
-        try (AdminClient admin = AdminClient.create(adminProps)) {
+        try (AdminClient admin =
+                     AdminClient.create(adminProperties)) {
+
             Set<String> existingTopics =
                     admin.listTopics().names().get();
 
             List<NewTopic> missingTopics = wantedTopics.stream()
-                    .filter(topic -> !existingTopics.contains(topic))
+                    .filter(topic ->
+                            !existingTopics.contains(topic))
                     .map(topic -> new NewTopic(
                             topic,
                             PARTITIONS,
@@ -196,107 +225,532 @@ public final class DataLoader {
     }
 
     /**
-     * Format d'une ligne source :
+     * Mode normal ou limité.
      *
-     * {
-     *   "key": "...",
-     *   "value": "<json ou texte brut>",
-     *   "ts_ms": 123456789
-     * }
+     * Les fichiers sont traités successivement, sans pause.
      */
-    private static long replay(
+    private static void replayImmediate(
             KafkaProducer<String, String> producer,
-            Path file,
-            String topic,
-            Integer limit
+            LoaderOptions options
     ) throws IOException {
+
+        for (SourceDefinition source : SOURCES) {
+            long count = replayImmediateSource(
+                    producer,
+                    source,
+                    options
+            );
+
+            System.out.printf(
+                    "%s -> %s : %d messages envoyes%n",
+                    source.file(),
+                    source.topic(),
+                    count
+            );
+        }
+    }
+
+    private static long replayImmediateSource(
+            KafkaProducer<String, String> producer,
+            SourceDefinition source,
+            LoaderOptions options
+    ) throws IOException {
+
+        checkFileExists(source.file());
+
+        long totalSent = 0;
+
+        try (BufferedReader reader =
+                     Files.newBufferedReader(source.file())) {
+
+            String line;
+
+            while ((line = nextNonBlankLine(reader)) != null) {
+                if (options.limit() != null
+                        && totalSent >= options.limit()) {
+                    break;
+                }
+
+                sendEnvelope(
+                        producer,
+                        source.topic(),
+                        line,
+                        options.liveTimestamps()
+                );
+
+                totalSent++;
+            }
+        }
+
+        producer.flush();
+
+        return totalSent;
+    }
+
+    /**
+     * Mode streaming alterné sur les trois topics.
+     *
+     * Exemple avec batchSize=10 :
+     *
+     * - 10 messages dans cartflow.orders ;
+     * - 10 messages dans cartflow.payments ;
+     * - 10 messages dans cartflow.stock.movements ;
+     * - flush ;
+     * - pause ;
+     * - cycle suivant.
+     *
+     * La limite est appliquée séparément à chaque fichier.
+     */
+    private static void replayStreaming(
+            KafkaProducer<String, String> producer,
+            LoaderOptions options
+    ) throws IOException, InterruptedException {
+
+        List<SourceCursor> cursors = openSourceCursors();
+
+        long cycle = 0;
+
+        try {
+            while (hasActiveSource(cursors)) {
+                cycle++;
+
+                int totalCycleSent = 0;
+
+                System.out.printf(
+                        "%n--- Cycle streaming %d ---%n",
+                        cycle
+                );
+
+                for (SourceCursor cursor : cursors) {
+                    int batchSent = sendBatch(
+                            producer,
+                            cursor,
+                            options
+                    );
+
+                    totalCycleSent += batchSent;
+
+                    System.out.printf(
+                            "%s : %d messages envoyes"
+                                    + " (total : %d)%n",
+                            cursor.source().topic(),
+                            batchSent,
+                            cursor.totalSent()
+                    );
+                }
+
+                producer.flush();
+
+                if (totalCycleSent == 0) {
+                    break;
+                }
+
+                if (hasActiveSource(cursors)
+                        && options.intervalMs() > 0) {
+
+                    System.out.printf(
+                            "Pause de %d ms...%n",
+                            options.intervalMs()
+                    );
+
+                    Thread.sleep(options.intervalMs());
+                }
+            }
+        } finally {
+            closeSourceCursors(cursors);
+        }
+
+        System.out.println();
+        System.out.println("Resume du streaming :");
+
+        for (SourceCursor cursor : cursors) {
+            System.out.printf(
+                    "%s -> %s : %d messages envoyes%n",
+                    cursor.source().file(),
+                    cursor.source().topic(),
+                    cursor.totalSent()
+            );
+        }
+    }
+
+    private static List<SourceCursor> openSourceCursors()
+            throws IOException {
+
+        List<SourceCursor> cursors = new ArrayList<>();
+
+        try {
+            for (SourceDefinition source : SOURCES) {
+                checkFileExists(source.file());
+
+                cursors.add(
+                        new SourceCursor(
+                                source,
+                                Files.newBufferedReader(source.file())
+                        )
+                );
+            }
+
+            return cursors;
+        } catch (IOException exception) {
+            closeSourceCursors(cursors);
+            throw exception;
+        }
+    }
+
+    private static void closeSourceCursors(
+            List<SourceCursor> cursors
+    ) {
+        for (SourceCursor cursor : cursors) {
+            try {
+                cursor.close();
+            } catch (IOException exception) {
+                System.err.println(
+                        "Impossible de fermer le fichier "
+                                + cursor.source().file()
+                                + " : "
+                                + exception.getMessage()
+                );
+            }
+        }
+    }
+
+    private static boolean hasActiveSource(
+            List<SourceCursor> cursors
+    ) {
+        return cursors.stream()
+                .anyMatch(SourceCursor::isActive);
+    }
+
+    private static int sendBatch(
+            KafkaProducer<String, String> producer,
+            SourceCursor cursor,
+            LoaderOptions options
+    ) throws IOException {
+
+        if (!cursor.isActive()) {
+            return 0;
+        }
+
+        int batchSent = 0;
+
+        while (batchSent < options.batchSize()) {
+            if (options.limit() != null
+                    && cursor.totalSent() >= options.limit()) {
+
+                cursor.finish();
+                break;
+            }
+
+            String line =
+                    nextNonBlankLine(cursor.reader());
+
+            if (line == null) {
+                cursor.finish();
+                break;
+            }
+
+            sendEnvelope(
+                    producer,
+                    cursor.source().topic(),
+                    line,
+                    options.liveTimestamps()
+            );
+
+            cursor.incrementTotalSent();
+            batchSent++;
+        }
+
+        return batchSent;
+    }
+
+    private static void sendEnvelope(
+            KafkaProducer<String, String> producer,
+            String topic,
+            String line,
+            boolean liveTimestamps
+    ) throws IOException {
+
+        RawEnvelope envelope =
+                MAPPER.readValue(
+                        line,
+                        RawEnvelope.class
+                );
+
+        long timestamp = liveTimestamps
+                ? System.currentTimeMillis()
+                : envelope.tsMs();
+
+        ProducerRecord<String, String> record =
+                new ProducerRecord<>(
+                        topic,
+                        null,
+                        timestamp,
+                        envelope.key(),
+                        envelope.value()
+                );
+
+        producer.send(record);
+    }
+
+    private static String nextNonBlankLine(
+            BufferedReader reader
+    ) throws IOException {
+
+        String line;
+
+        while ((line = reader.readLine()) != null) {
+            if (!line.isBlank()) {
+                return line;
+            }
+        }
+
+        return null;
+    }
+
+    private static void checkFileExists(
+            Path file
+    ) throws IOException {
+
         if (!Files.exists(file)) {
             throw new IOException(
                     "Fichier introuvable : "
                             + file.toAbsolutePath()
             );
         }
-
-        long count = 0;
-
-        try (BufferedReader reader =
-                     Files.newBufferedReader(file)) {
-
-            String line;
-
-            while ((limit == null || count < limit)
-                    && (line = reader.readLine()) != null) {
-
-                if (line.isBlank()) {
-                    continue;
-                }
-
-                RawEnvelope envelope =
-                        MAPPER.readValue(
-                                line,
-                                RawEnvelope.class
-                        );
-
-                ProducerRecord<String, String> record =
-                        new ProducerRecord<>(
-                                topic,
-                                null,
-                                envelope.tsMs(),
-                                envelope.key(),
-                                envelope.value()
-                        );
-
-                producer.send(record);
-                count++;
-            }
-        }
-
-        producer.flush();
-
-        return count;
     }
 
-    /**
-     * Interprétation de l'option --limit :
-     *
-     * - absence de --limit : null, donc tout envoyer ;
-     * - --limit 500       : envoyer au maximum 500 messages ;
-     * - --limit 0         : ne transmettre aucun message.
-     */
-    private static Integer parseLimit(String[] args) {
+    private static LoaderOptions parseOptions(
+            String[] args
+    ) {
+        Integer limit = null;
+        int batchSize = 0;
+        long intervalMs = 0;
+        boolean liveTimestamps = false;
+        boolean topicsOnly = false;
+
         for (int i = 0; i < args.length; i++) {
-            if (!"--limit".equals(args[i])) {
-                continue;
-            }
+            String argument = args[i];
 
-            if (i + 1 >= args.length) {
-                throw new IllegalArgumentException(
-                        "L'option --limit attend une valeur entiere."
+            switch (argument) {
+                case "--limit" -> {
+                    limit = parseNonNegativeInteger(
+                            args,
+                            ++i,
+                            "--limit"
+                    );
+                }
+
+                case "--batch-size" -> {
+                    batchSize = parsePositiveInteger(
+                            args,
+                            ++i,
+                            "--batch-size"
+                    );
+                }
+
+                case "--interval-ms" -> {
+                    intervalMs = parseNonNegativeLong(
+                            args,
+                            ++i,
+                            "--interval-ms"
+                    );
+                }
+
+                case "--live-timestamps" ->
+                        liveTimestamps = true;
+
+                case "--topics-only" ->
+                        topicsOnly = true;
+
+                default -> throw new IllegalArgumentException(
+                        "Argument inconnu : " + argument
                 );
             }
-
-            int limit;
-
-            try {
-                limit = Integer.parseInt(args[i + 1]);
-            } catch (NumberFormatException exception) {
-                throw new IllegalArgumentException(
-                        "Valeur invalide pour --limit : "
-                                + args[i + 1],
-                        exception
-                );
-            }
-
-            if (limit < 0) {
-                throw new IllegalArgumentException(
-                        "--limit doit etre superieur ou egal a 0."
-                );
-            }
-
-            return limit;
         }
 
-        return null;
+        if (intervalMs > 0 && batchSize == 0) {
+            throw new IllegalArgumentException(
+                    "--interval-ms necessite --batch-size."
+            );
+        }
+
+        return new LoaderOptions(
+                limit,
+                batchSize,
+                intervalMs,
+                liveTimestamps,
+                topicsOnly
+        );
+    }
+
+    private static int parsePositiveInteger(
+            String[] args,
+            int index,
+            String option
+    ) {
+        int value = parseNonNegativeInteger(
+                args,
+                index,
+                option
+        );
+
+        if (value == 0) {
+            throw new IllegalArgumentException(
+                    option + " doit etre superieur a 0."
+            );
+        }
+
+        return value;
+    }
+
+    private static int parseNonNegativeInteger(
+            String[] args,
+            int index,
+            String option
+    ) {
+        String rawValue = getOptionValue(
+                args,
+                index,
+                option
+        );
+
+        int value;
+
+        try {
+            value = Integer.parseInt(rawValue);
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException(
+                    "Valeur invalide pour "
+                            + option
+                            + " : "
+                            + rawValue,
+                    exception
+            );
+        }
+
+        if (value < 0) {
+            throw new IllegalArgumentException(
+                    option
+                            + " doit etre superieur"
+                            + " ou egal a 0."
+            );
+        }
+
+        return value;
+    }
+
+    private static long parseNonNegativeLong(
+            String[] args,
+            int index,
+            String option
+    ) {
+        String rawValue = getOptionValue(
+                args,
+                index,
+                option
+        );
+
+        long value;
+
+        try {
+            value = Long.parseLong(rawValue);
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException(
+                    "Valeur invalide pour "
+                            + option
+                            + " : "
+                            + rawValue,
+                    exception
+            );
+        }
+
+        if (value < 0) {
+            throw new IllegalArgumentException(
+                    option
+                            + " doit etre superieur"
+                            + " ou egal a 0."
+            );
+        }
+
+        return value;
+    }
+
+    private static String getOptionValue(
+            String[] args,
+            int index,
+            String option
+    ) {
+        if (index >= args.length) {
+            throw new IllegalArgumentException(
+                    "L'option "
+                            + option
+                            + " attend une valeur."
+            );
+        }
+
+        return args[index];
+    }
+
+    private record LoaderOptions(
+            Integer limit,
+            int batchSize,
+            long intervalMs,
+            boolean liveTimestamps,
+            boolean topicsOnly
+    ) {
+    }
+
+    private record SourceDefinition(
+            Path file,
+            String topic
+    ) {
+    }
+
+    private static final class SourceCursor
+            implements AutoCloseable {
+
+        private final SourceDefinition source;
+        private final BufferedReader reader;
+
+        private long totalSent;
+        private boolean active = true;
+
+        private SourceCursor(
+                SourceDefinition source,
+                BufferedReader reader
+        ) {
+            this.source = source;
+            this.reader = reader;
+        }
+
+        SourceDefinition source() {
+            return source;
+        }
+
+        BufferedReader reader() {
+            return reader;
+        }
+
+        long totalSent() {
+            return totalSent;
+        }
+
+        boolean isActive() {
+            return active;
+        }
+
+        void incrementTotalSent() {
+            totalSent++;
+        }
+
+        void finish() {
+            active = false;
+        }
+
+        @Override
+        public void close() throws IOException {
+            reader.close();
+        }
     }
 
     private record RawEnvelope(
