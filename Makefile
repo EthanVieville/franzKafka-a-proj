@@ -13,7 +13,7 @@ LIMIT ?=
 BATCH_SIZE ?= 10
 INTERVAL_MS ?= 1000
 
-.PHONY: help up wait-kafka topics init run load stream reset down status dlq
+.PHONY: help up wait-kafka topics init run load stream reset down status dlq confirmed
 
 help:
 	@echo "Cibles disponibles :"
@@ -31,7 +31,7 @@ help:
 	@echo "      Envoie immediatement toutes les donnees."
 	@echo ""
 	@echo "  make load LIMIT=500"
-	@echo "      Envoie immediatement au plus 500 lignes par fichier."
+	@echo "      Envoie au plus 500 lignes par fichier."
 	@echo ""
 	@echo "  make stream"
 	@echo "      Envoie les donnees par batch de 10 toutes les 1000 ms."
@@ -46,7 +46,10 @@ help:
 	@echo "      Affiche les containers et le lag Kafka Streams."
 	@echo ""
 	@echo "  make dlq"
-	@echo "      Affiche le contenu du DLQ."
+	@echo "      Affiche les 20 premiers messages du DLQ."
+	@echo ""
+	@echo "  make confirmed"
+	@echo "      Affiche les 20 premiers messages de orders.confirmed."
 	@echo ""
 	@echo "  make reset"
 	@echo "      Supprime le cluster, les volumes et le dossier target."
@@ -92,10 +95,10 @@ run:
 ## Chargement immediat
 ## ---------------------------------------------------------------------------
 
-# Sans LIMIT :
+# Tout envoyer :
 #   make load
 #
-# Avec une limite par fichier :
+# Limiter le nombre de messages par fichier :
 #   make load LIMIT=500
 load:
 	GROUPE=$(GROUPE) KAFKA_BOOTSTRAP=$(KAFKA_BOOTSTRAP) \
@@ -113,7 +116,6 @@ load:
 #   make stream BATCH_SIZE=5 INTERVAL_MS=2000 LIMIT=500
 #
 # --live-timestamps utilise l'heure actuelle comme timestamp Kafka.
-# Cela permet de tester correctement les fenetres temporelles Kafka Streams.
 stream:
 	GROUPE=$(GROUPE) KAFKA_BOOTSTRAP=$(KAFKA_BOOTSTRAP) \
 		mvn -q compile exec:java \
@@ -136,12 +138,26 @@ status:
 		grep -v "^Note:" || true
 
 dlq:
+	@echo "(20 premiers messages max - le topic peut en contenir davantage)"
 	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
 		/opt/kafka/bin/kafka-console-consumer.sh \
 		--bootstrap-server localhost:9092 \
 		--topic $(GROUPE).cartflow.dlq \
 		--from-beginning \
-		--timeout-ms 5000 \
+		--max-messages 20 \
+		--timeout-ms 15000 \
+		--property print.key=true 2>&1 | \
+		grep -v "^\["
+
+confirmed:
+	@echo "(20 premiers messages max - le topic peut en contenir davantage)"
+	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
+		/opt/kafka/bin/kafka-console-consumer.sh \
+		--bootstrap-server localhost:9092 \
+		--topic $(GROUPE).cartflow.orders.confirmed \
+		--from-beginning \
+		--max-messages 20 \
+		--timeout-ms 15000 \
 		--property print.key=true 2>&1 | \
 		grep -v "^\["
 
