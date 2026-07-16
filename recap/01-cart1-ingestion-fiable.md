@@ -182,8 +182,117 @@ pill géré.*
 - **Test manuel sur le vrai cluster** : appli lancée (`GROUPE=grp01`), messages
   produits à la main via Kafbat UI (`localhost:8080`) sur `cartflow.orders`,
   vérification du contenu de `grp01.cartflow.dlq`.
+- **Test à grande échelle sur données réelles** : voir section 8 ci-dessous.
 
-## 8. Ce qui n'est PAS fait (scope restant)
+## 8. Validation avec les données réelles (`DataLoader`)
+
+### Le problème : `data/raw/*.jsonl` n'ont jamais été poussés dans Kafka
+
+Le repo fournit 3 fichiers d'échantillons (`cartflow.orders.jsonl`,
+`cartflow.payments.jsonl`, `cartflow.stock.movements.jsonl` — ~55k/48k/145k
+lignes), au format `{"key": ..., "value": "<json ou texte cassé>", "ts_ms": ...}`.
+Ce sont des fichiers sur disque : personne ne les avait produits sur le
+cluster local. Il fallait un outil de "chargement" pour les rejouer sur
+`cartflow.orders`/`payments`/`stock.movements`.
+
+### Pourquoi pas Kafka Connect ?
+
+Piste envisagée puis écartée : le connecteur natif `FileStreamSourceConnector`
+lit un fichier **ligne par ligne** et produit **la ligne entière** comme
+valeur du message (clé `null`), sans jamais parser de JSON. Il ne sait donc
+pas déballer l'enveloppe `{key, value, ts_ms}` ni promouvoir `key` en clé
+Kafka. Le faire proprement demanderait soit un *Single Message Transform*
+personnalisé (donc du code quand même, packagé en plugin Connect en plus),
+soit un connecteur tiers (dépendance externe, `plugin.path` à configurer) —
+plus lourd que d'écrire directement le chargeur.
+
+### La solution : `tools/DataLoader.java`
+
+Petite classe Java **autonome** (un simple `main()`, aucune annotation
+Spring — donc invisible pour le component scan de `CartflowApplication`,
+zéro interférence avec la topologie) :
+
+1. **Crée les topics manquants** via `AdminClient.listTopics()` /
+   `createTopics(...)`, en réutilisant `Topics.ORDERS` / `Topics.PAYMENTS` /
+   `Topics.STOCK_MOVEMENTS` comme unique source de vérité pour les noms (pas
+   de duplication en dur).
+2. Lit chaque fichier `data/raw/*.jsonl` ligne par ligne, déballe l'enveloppe
+   avec Jackson (`record RawEnvelope(key, value, ts_ms)`).
+3. Produit chaque `(key, value)` via un `KafkaProducer<String,String>`
+   classique, **en réinjectant `ts_ms` comme timestamp du record Kafka**
+   (`ProducerRecord(topic, null, tsMs, key, value)`) plutôt que de laisser
+   Kafka mettre l'heure d'envoi réelle — utile pour que les futures fenêtres
+   (CART-2/3/4, basées sur le temps événement) restent cohérentes avec
+   l'étalement temporel d'origine des données, même si on rejoue tout en
+   quelques secondes.
+4. Zéro nouvelle dépendance : `kafka-clients` (via `kafka-streams`) et
+   Jackson étaient déjà dans le `pom.xml`.
+
+Lancement : `mvn exec:java` (plugin `exec-maven-plugin` ajouté au `pom.xml`,
+outil de dev uniquement, n'affecte pas le jar Spring Boot livré), avec un
+`--limit N` optionnel pour tester sur un échantillon avant d'envoyer les
+fichiers complets.
+
+### Incident pendant le test : la même appli, deux versions du code
+
+Premier essai avec `--limit 50` : ça a **crashé l'appli qui tournait en
+fond**. En creusant les logs, c'était exactement le bug NPE de la section 4
+(`WAREHOUSES.contains(null)` sur un mouvement de stock sans `warehouse`,
+message réel `sku-0010` du dataset). Le twist : le correctif était bien sur
+le disque et validé par les 10 tests unitaires (`mvn clean package` vert) au
+moment de l'incident — mais l'instance `mvn spring-boot:run` en arrière-plan
+avait été **démarrée avant** ce correctif, et Maven ne recharge pas le code
+à chaud. Le process gardait donc l'ancien bytecode buggé en mémoire.
+
+*A retenir pour l'oral : après un fix, il faut redémarrer `spring-boot:run`
+pour qu'il prenne effet — sinon on teste l'ancien code sans le savoir. Ça a
+d'ailleurs servi de preuve grandeur nature que le bug était réel : sans le
+fix, l'appli meurt bel et bien sur une vraie anomalie du dataset.*
+
+Après redémarrage avec le code corrigé, le rejeu complet (les 3 fichiers en
+entier, sans `--limit`) est passé sans aucun crash.
+
+### Résultats sur le dataset complet
+
+| Indicateur | Valeur |
+|---|---|
+| Messages envoyés | 248 001 (55 253 orders + 47 664 payments + 145 173 stock ; l'écart avec la taille des fichiers vient des ~100 messages de test envoyés manuellement/en échantillon avant) |
+| Temps d'envoi | ~4 secondes (un seul `KafkaProducer`, idempotent, tout en flux continu) |
+| Lag du consumer group `cartflow-grp01` | **0** sur les 9 partitions (3 topics × 3 partitions) → tout consommé |
+| Crash pendant le traitement | **Aucun** |
+| Messages en DLQ | 15 305 (**6,2%** du total) |
+
+Le README annonce "~7% + retards + doublons" d'anomalies : l'écart avec les
+6,2% observés s'explique par les **doublons**, qui sont syntaxiquement et
+métier-valides (donc jamais rejetés par la validation CART-1 — la dédup est
+un sujet de fenêtrage, hors scope ici).
+
+Répartition des rejets par raison (le total tombe pile à 15 305) :
+
+| Raison | Occurrences |
+|---|---|
+| JSON illisible ou tronqué (poison pill) | 5 764 |
+| timestamp illisible | 2 998 |
+| warehouse inconnu | 1 917 |
+| delta manquant | 865 |
+| sku manquant | 852 |
+| order_id manquant | 503 |
+| total manquant ou ≤ 0 | 467 |
+| card_id manquant | 447 |
+| amount manquant ou ≤ 0 | 426 |
+| status inconnu | 324 |
+| payment_id manquant | 231 |
+| items manquants ou vide | 225 |
+| user_id manquant | 201 |
+| currency manquant | 85 |
+
+Chaque anomalie décrite dans le tableau du README est représentée dans les
+vraies données. Les 3 critères d'acceptation de CART-1 sont donc validés à
+la fois par les tests unitaires **et** en conditions réelles sur le cluster
+Docker : *10 min sans crash (ici : 248k messages sans crash), DLQ motivée,
+aucun message valide perdu (lag = 0, rien n'est resté bloqué)*.
+
+## 9. Ce qui n'est PAS fait (scope restant)
 
 - Rien n'est encore branché sur une sortie "métier" — `validPayments` et
   `validStock` sont calculés mais pas encore consommés (normal, c'est CART-2
@@ -194,7 +303,7 @@ pill géré.*
 - Le `LOG.info`/`peek` fourni initialement a été supprimé (demandé par le
   README).
 
-## 9. Questions probables à l'oral (anticipation)
+## 10. Questions probables à l'oral (anticipation)
 
 - *"Pourquoi ne pas juste utiliser le Serde JSON directement sur le topic
   source ?"* → réponse en section 3 (poison pill / `deserialization.exception.handler`).
@@ -211,3 +320,12 @@ pill géré.*
   branche `valid`/`invalid` du `split()` couvre 100% des messages entrants
   (pas de 3ème branche silencieuse) ; les tests "message valide" vérifient
   explicitement qu'ils ne finissent pas en DLQ.
+- *"Vous avez testé avec de vraies données, pas juste des tests unitaires ?"*
+  → oui, section 8 : 248k messages réels rejoués via `tools/DataLoader.java`,
+  0 crash, lag consumer = 0, DLQ à 6,2% cohérente avec le taux d'anomalies
+  annoncé par le sujet.
+- *"Pourquoi ne pas avoir utilisé Kafka Connect pour charger les fichiers ?"*
+  → `FileStreamSourceConnector` ne parse pas le JSON, il produit la ligne
+  brute telle quelle ; il aurait fallu un SMT personnalisé ou un connecteur
+  tiers pour déballer l'enveloppe `{key, value, ts_ms}` — plus lourd qu'un
+  petit `KafkaProducer` fait main, pour un besoin de chargement ponctuel.

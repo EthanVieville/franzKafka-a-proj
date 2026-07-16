@@ -58,6 +58,15 @@
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-maven-plugin</artifactId>
       </plugin>
+      <!-- Outil de dev : mvn exec:java rejoue data/raw/*.jsonl sur le cluster local (DataLoader). -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.5.0</version>
+        <configuration>
+          <mainClass>fr.esgi.kafka.cartflow.tools.DataLoader</mainClass>
+        </configuration>
+      </plugin>
     </plugins>
   </build>
 </project>
