@@ -1,9 +1,3 @@
-# Commandes du projet CARTFLOW. `make help` pour la liste.
-#
-# MSYS_NO_PATHCONV evite que Git Bash convertisse les chemins Unix
-# (ex: /opt/kafka/bin/...) passes a `docker exec` en chemins Windows.
-export MSYS_NO_PATHCONV = 1
-
 GROUPE ?= grp01
 KAFKA_BOOTSTRAP ?= localhost:29092
 LIMIT ?=
@@ -12,14 +6,14 @@ LIMIT ?=
 
 help:
 	@echo "Cibles disponibles :"
-	@echo "  make init              - 1ere fois : cluster Docker + attente + topics (source + DLQ)"
-	@echo "  make up                - demarre juste le cluster Docker (Kafka + Kafbat UI)"
-	@echo "  make run [GROUPE=xxx]  - lance l'appli Spring Boot (GROUPE=grp01 par defaut)"
-	@echo "  make load              - envoie data/raw/*.jsonl EN ENTIER sur les topics source"
-	@echo "  make load LIMIT=500    - envoie au plus 500 lignes par fichier"
-	@echo "  make status            - etat des containers + lag du consumer group"
-	@echo "  make dlq                - affiche le contenu de <GROUPE>.cartflow.dlq"
-	@echo "  make reset             - stoppe/supprime le cluster Docker (efface tout, y compris l'UI) + mvn clean"
+	@echo "  make init              - cluster Docker + attente + creation des topics"
+	@echo "  make up                - demarre Kafka et Kafbat UI"
+	@echo "  make run [GROUPE=xxx]  - lance l'application Spring Boot"
+	@echo "  make load              - charge toutes les donnees"
+	@echo "  make load LIMIT=500    - charge au plus 500 lignes par fichier"
+	@echo "  make status            - affiche les containers et le lag"
+	@echo "  make dlq               - affiche le contenu du DLQ"
+	@echo "  make reset             - supprime le cluster et nettoie target"
 
 ## --- Demarrage ---
 
@@ -28,26 +22,35 @@ up:
 
 wait-kafka:
 	@echo "Attente que le cluster Kafka reponde..."
-	@until docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1; do \
+	@until MSYS_NO_PATHCONV=1 docker exec kafka-1 \
+		/opt/kafka/bin/kafka-topics.sh \
+		--bootstrap-server localhost:9092 \
+		--list >/dev/null 2>&1; do \
 		sleep 2; \
 	done
 	@echo "Cluster pret."
 
 topics:
-	mvn -q exec:java -Dexec.args="--limit 0"
+	GROUPE=$(GROUPE) KAFKA_BOOTSTRAP=$(KAFKA_BOOTSTRAP) \
+		mvn -q compile exec:java -Dexec.args="--topics-only"
+
+
 
 init: up wait-kafka topics
 	@echo ""
-	@echo "Init terminee : cluster + topics (source + DLQ) prets."
-	@echo "Etape suivante : make run   (dans un autre terminal), puis make load"
+	@echo "Init terminee."
+	@echo "Etape suivante : make run, puis make load dans un autre terminal."
 
-## --- Appli et donnees ---
+## --- Application et donnees ---
 
 run:
-	GROUPE=$(GROUPE) KAFKA_BOOTSTRAP=$(KAFKA_BOOTSTRAP) mvn spring-boot:run
+	GROUPE=$(GROUPE) KAFKA_BOOTSTRAP=$(KAFKA_BOOTSTRAP) \
+		mvn spring-boot:run
 
 load:
-	mvn -q exec:java $(if $(LIMIT),-Dexec.args="--limit $(LIMIT)",)
+	GROUPE=$(GROUPE) KAFKA_BOOTSTRAP=$(KAFKA_BOOTSTRAP) \
+		mvn -q compile exec:java \
+		$(if $(LIMIT),-Dexec.args="--limit $(LIMIT)",)
 
 ## --- Observabilite ---
 
@@ -56,19 +59,27 @@ status:
 	@docker ps --format "table {{.Names}}\t{{.Status}}"
 	@echo ""
 	@echo "=== Lag du consumer group cartflow-$(GROUPE) ==="
-	@docker exec kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
-		--bootstrap-server localhost:9092 --describe --group cartflow-$(GROUPE) 2>&1 | grep -v "^Note:" || true
+	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
+		/opt/kafka/bin/kafka-consumer-groups.sh \
+		--bootstrap-server localhost:9092 \
+		--describe \
+		--group cartflow-$(GROUPE) 2>&1 | grep -v "^Note:" || true
 
 dlq:
-	docker exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
-		--bootstrap-server localhost:9092 --topic $(GROUPE).cartflow.dlq \
-		--from-beginning --timeout-ms 5000 --property print.key=true 2>&1 | grep -v "^\["
+	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
+		/opt/kafka/bin/kafka-console-consumer.sh \
+		--bootstrap-server localhost:9092 \
+		--topic $(GROUPE).cartflow.dlq \
+		--from-beginning \
+		--timeout-ms 5000 \
+		--property print.key=true 2>&1 | grep -v "^\["
 
 ## --- Nettoyage ---
 
 down:
 	docker compose down
 
-reset: down
+reset:
+	docker compose down -v --remove-orphans
 	mvn -q clean
-	@echo "Reset complet : cluster Docker (Kafka + Kafbat UI, donc tous les topics/messages) supprime, target/ nettoye."
+	@echo "Reset complet : volumes, topics, messages et target supprimes."
