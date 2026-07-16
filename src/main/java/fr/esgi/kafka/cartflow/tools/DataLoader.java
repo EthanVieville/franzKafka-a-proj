@@ -98,41 +98,20 @@ public final class DataLoader {
         return properties;
     }
 
-    private static void createMissingTopics(
-            String bootstrap
-    ) throws Exception {
-        Properties adminProps = new Properties();
+    private static void createMissingTopics(String bootstrap) throws Exception {
+        Properties properties = new Properties();
+        properties.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
 
-        adminProps.put(
-                AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
-                bootstrap
-        );
+        Set<String> wanted = new HashSet<>();
+        SOURCES.forEach(source -> wanted.add(source.topic()));
+        wanted.add(Topics.DLQ);
+        wanted.add(Topics.ORDERS_CONFIRMED);
 
-        /*
-         * Creation des trois topics sources, de la DLQ et des topics de
-         * sortie des tickets suivants (orders.confirmed pour CART-2, etc).
-         *
-         * Tous crees explicitement pour ne pas dependre de l'auto-creation
-         * Kafka (qui utilise le nombre de partitions par defaut du broker,
-         * pas forcement 3 comme le reste - observe sur orders.confirmed).
-         */
-        Set<String> wantedTopics =
-                new HashSet<>(FILE_TO_TOPIC.values());
-
-        wantedTopics.add(Topics.DLQ);
-        wantedTopics.add(Topics.ORDERS_CONFIRMED);
-
-        try (AdminClient admin = AdminClient.create(adminProps)) {
-            Set<String> existingTopics =
-                    admin.listTopics().names().get();
-
-            List<NewTopic> missingTopics = wantedTopics.stream()
-                    .filter(topic -> !existingTopics.contains(topic))
-                    .map(topic -> new NewTopic(
-                            topic,
-                            PARTITIONS,
-                            REPLICATION_FACTOR
-                    ))
+        try (AdminClient admin = AdminClient.create(properties)) {
+            Set<String> existing = admin.listTopics().names().get();
+            List<NewTopic> missing = wanted.stream()
+                    .filter(topic -> !existing.contains(topic))
+                    .map(topic -> new NewTopic(topic, PARTITIONS, REPLICATION_FACTOR))
                     .toList();
 
             if (missing.isEmpty()) {
