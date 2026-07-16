@@ -153,15 +153,18 @@ public final class DataLoader {
         );
 
         /*
-         * Création des trois topics sources et du DLQ.
+         * Creation des trois topics sources, de la DLQ et des topics de
+         * sortie des tickets suivants (orders.confirmed pour CART-2, etc).
          *
-         * Le DLQ est créé explicitement pour ne pas dépendre de
-         * l'auto-création Kafka au premier message invalide.
+         * Tous crees explicitement pour ne pas dependre de l'auto-creation
+         * Kafka (qui utilise le nombre de partitions par defaut du broker,
+         * pas forcement 3 comme le reste - observe sur orders.confirmed).
          */
         Set<String> wantedTopics =
                 new HashSet<>(FILE_TO_TOPIC.values());
 
         wantedTopics.add(Topics.DLQ);
+        wantedTopics.add(Topics.ORDERS_CONFIRMED);
 
         try (AdminClient admin = AdminClient.create(adminProps)) {
             Set<String> existingTopics =

@@ -7,7 +7,7 @@ GROUPE ?= grp01
 KAFKA_BOOTSTRAP ?= localhost:29092
 LIMIT ?=
 
-.PHONY: help up wait-kafka topics init run load reset down status dlq
+.PHONY: help up wait-kafka topics init run load reset down status dlq confirmed
 
 help:
 	@echo "Cibles disponibles :"
@@ -18,6 +18,7 @@ help:
 	@echo "  make load LIMIT=500    - charge au plus 500 lignes par fichier"
 	@echo "  make status            - affiche les containers et le lag"
 	@echo "  make dlq               - affiche le contenu du DLQ"
+	@echo "  make confirmed         - affiche le contenu de orders.confirmed (CART-2)"
 	@echo "  make reset             - supprime le cluster et nettoie target"
 
 ## --- Demarrage ---
@@ -69,12 +70,25 @@ status:
 		--group cartflow-$(GROUPE) 2>&1 | grep -v "^Note:" || true
 
 dlq:
+	@echo "(20 premiers messages max - le topic peut en contenir bien plus, voir 'make status')"
 	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
 		/opt/kafka/bin/kafka-console-consumer.sh \
 		--bootstrap-server localhost:9092 \
 		--topic $(GROUPE).cartflow.dlq \
 		--from-beginning \
-		--timeout-ms 5000 \
+		--max-messages 20 \
+		--timeout-ms 15000 \
+		--property print.key=true 2>&1 | grep -v "^\["
+
+confirmed:
+	@echo "(20 premiers messages max - le topic peut en contenir bien plus, voir 'make status')"
+	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
+		/opt/kafka/bin/kafka-console-consumer.sh \
+		--bootstrap-server localhost:9092 \
+		--topic $(GROUPE).cartflow.orders.confirmed \
+		--from-beginning \
+		--max-messages 20 \
+		--timeout-ms 15000 \
 		--property print.key=true 2>&1 | grep -v "^\["
 
 ## --- Nettoyage ---

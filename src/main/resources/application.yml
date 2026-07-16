@@ -9,6 +9,16 @@ spring:
         default.key.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
         default.value.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
         auto.offset.reset: earliest
+        # CART-2 : par defaut (0), Kafka Streams n'attend pas d'avoir des
+        # donnees sur les DEUX cotes d'un join avant d'avancer son horloge
+        # interne (stream time). En rejeu massif (DataLoader envoie tout un
+        # fichier d'un coup), ca fait fermer des fenetres de join avant que
+        # le paiement pourtant a l'heure soit traite - teste jusqu'a 21% de
+        # commandes confirmees en trop peu (idle=0) contre 98% (idle=60s).
+        # En flux reel continu (generateur du prof), ce n'est pas necessaire
+        # (orders/payments arrivent deja entrelaces) ; on garde une valeur
+        # raisonnable pour rester correct sans latence excessive.
+        max.task.idle.ms: 10000
         # Bonus fiabilite (CART-6) :
         # processing.guarantee: exactly_once_v2
 
