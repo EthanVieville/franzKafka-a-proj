@@ -1,3 +1,8 @@
+# Force bash pour executer les recettes, peu importe le terminal depuis
+# lequel `make` est lance (PowerShell/cmd utiliseraient sinon cmd.exe, qui
+# ne comprend pas la syntaxe bash utilisee ici : until/done, /dev/null...).
+SHELL := bash.exe
+
 GROUPE ?= grp01
 KAFKA_BOOTSTRAP ?= localhost:29092
 LIMIT ?=
@@ -33,8 +38,6 @@ wait-kafka:
 topics:
 	GROUPE=$(GROUPE) KAFKA_BOOTSTRAP=$(KAFKA_BOOTSTRAP) \
 		mvn -q compile exec:java -Dexec.args="--topics-only"
-
-
 
 init: up wait-kafka topics
 	@echo ""
