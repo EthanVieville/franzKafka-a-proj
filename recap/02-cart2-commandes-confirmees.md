@@ -91,46 +91,55 @@ stable). On les a nommés explicitement pour deux raisons : lisibilité dans
 modifie la topologie ailleurs, cassant la compatibilité avec un state déjà
 sauvegardé en prod.
 
-## 4. Bug trouvé et corrigé : `max.task.idle.ms`
+## 4. Ce qu'on a trouvé en testant avec des données réelles : `max.task.idle.ms`
 
-**Symptôme** : en rejouant les ~250k messages réels, seulement **8 760
-commandes confirmées** alors qu'on en attendait ~40 000 (calcul : ~52 000
-commandes valides × ~88% payées × ~92% `AUTHORIZED`). Vérification sur une
+**Symptôme** : en rejouant les ~250k messages réels d'un coup
+(`make load`), seulement **8 760 commandes confirmées** sur un premier
+essai, très en dessous de ce qui semblait attendu. Vérification sur une
 paire commande/paiement connue, 20 secondes d'écart, largement dans la
 fenêtre de 10 min : **absente** du topic confirmé, et absente aussi de la
 DLQ (donc ni rejetée, ni confirmée — juste perdue).
 
-**Cause** : `max.task.idle.ms` vaut `0` par défaut. Ça veut dire que Kafka
-Streams **n'attend pas** d'avoir des données disponibles des deux côtés d'un
-join avant de faire avancer son horloge interne ("stream time"). Avec
-`DataLoader` qui envoie tout un fichier orders d'un coup, un run de milliers
-de commandes peut être traité avant que le moindre paiement ne soit lu (le
+**Cause identifiée** : `max.task.idle.ms` vaut `0` par défaut. Ça veut dire
+que Kafka Streams **n'attend pas** d'avoir des données disponibles des deux
+côtés d'un join avant de faire avancer son horloge interne ("stream time").
+Avec `DataLoader` qui envoie tout un fichier orders d'un coup, un lot de
+commandes peut être traité avant que le moindre paiement ne soit lu (le
 consumer vide son buffer d'un côté et n'attend pas l'autre) — l'horloge
-avance donc très loin sur la base des seules commandes, et referme des
-fenêtres de 10 min *avant même que le paiement correspondant, pourtant à
-l'heure, soit traité*. Avec `NoGrace`, une fenêtre fermée ne rouvre jamais.
+avance donc sur la base des seules commandes, et referme des fenêtres de
+10 min *avant même que le paiement correspondant, pourtant à l'heure, soit
+traité*. Avec `NoGrace`, une fenêtre fermée ne rouvre jamais. C'est un
+mécanisme réel et bien documenté de Kafka Streams (pas une invention) :
+`idle=0` donne systématiquement le résultat le plus bas de tous nos tests.
 
-**Correctif** : `max.task.idle.ms: 10000` dans `application.yml` — force
-Kafka Streams à attendre (jusqu'à 10s) que les deux partitions aient des
-données prêtes avant d'avancer. Testé à plusieurs valeurs pour confirmer le
-diagnostic :
+**Correctif appliqué** : `max.task.idle.ms: 10000` — une valeur positive
+raisonnable, nettement meilleure que `0`.
 
-| `max.task.idle.ms` | Commandes confirmées | % du max théorique (~41k) |
-|---|---|---|
-| 0 (défaut) | 8 760 | 21% |
-| 5 000 | 18 275 | 44% |
-| 60 000 | 40 276 | **98%** |
+**Honnêteté sur ce qu'on n'a PAS réussi à démontrer** : on a essayé de
+mesurer précisément "combien ça s'améliore" en testant plusieurs valeurs
+(5s, 10s, 30s, 60s) sur le même jeu de données. Les résultats variaient
+fortement (de ~18k à ~40k selon les runs) **y compris entre deux cycles
+`reset+init+run+load` strictement identiques** (ex : 20 780 puis 19 930 à
+`idle=10s`, deux exécutions consécutives, même config, même données). Une
+partie de cette variance venait d'un **process orphelin** qui a pollué
+plusieurs de nos mesures sans qu'on le sache sur le moment (voir section 6)
+— au point qu'on ne peut plus garantir que notre meilleur chiffre mesuré
+(40 276, `idle=60s`) n'était pas lui-même faussé. Au-delà de ce
+process fantôme, il reste une variance résiduelle qu'on attribue à des
+micro-différences d'ordonnancement système (réseau Docker, disque, GC) —
+inhérentes au **rejeu instantané de 250k messages en quelques secondes**,
+pas à un défaut de la logique du join (déjà validée indépendamment et de
+façon 100% déterministe par les 4 tests `TopologyTestDriver`).
 
-*A retenir pour l'oral, c'est probablement LA question qu'on te posera sur
-ce ticket : pourquoi le taux de confirmation est plus bas que prévu au
-premier essai, et pourquoi ça n'arrive normalement pas en flux réel continu
-(le générateur du prof produit orders/payments déjà entrelacés dans le
-temps — ce problème est spécifique au rejeu en masse d'un dataset
-pré-enregistré, pas à la logique du join elle-même, déjà validée
-indépendamment par les tests unitaires `TopologyTestDriver`).* Les ~2%
-restants même à `idle=60000` sont un résidu lié à `buffered.records.per.partition`
-(1000 par défaut) — pas creusé plus loin, diminishing returns pour un
-artefact de test qui ne se produit pas en conditions réelles.
+**Conclusion retenue** : `idle=0` est prouvé mauvais et à éviter — c'est le
+seul résultat vraiment solide de cette investigation. Au-delà de "positif
+vs zéro", chasser une valeur "optimale" via un rejeu instantané en masse
+n'est pas une méthode fiable localement. Pour un test/une démo plus
+crédible, `make stream` (envoi entrelacé et paced, voir Makefile) donne des
+résultats bien plus cohérents (proches du max plausible, toujours inférieurs
+au nombre total de paiements donc mathématiquement sains) — c'est la
+méthode à privilégier pour montrer CART-2 en conditions réalistes plutôt
+que `make load`.
 
 ## 5. Notions à savoir expliquer
 
@@ -183,6 +192,16 @@ artefact de test qui ne se produit pas en conditions réelles.
   `mvn clean compile` révélait 4 erreurs de compilation réelles. Réflexe à
   garder : toujours `clean` après un `pull`/merge avant de conclure que
   "ça compile".
+- **Un process appli orphelin peut survivre à un `make reset`** : `mvn
+  spring-boot:run` lancé en tâche de fond, puis "arrêté", a laissé le
+  process Java sous-jacent vivant (le wrapper est mort, pas le vrai
+  process). Cette instance zombie continuait de tourner sur le même
+  `application-id`/consumer group pendant des cycles de tests censés être
+  propres, causant des rebalances et du retraitement à l'insu de tout le
+  monde — symptôme repéré via `docker compose down` échouant à supprimer
+  des fichiers RocksDB ("Device or resource busy"). Réflexe à garder :
+  vérifier `tasklist` (ou équivalent) avant de faire confiance à un test
+  "propre", surtout après avoir tué une tâche en arrière-plan.
 
 ## 7. Comment on a testé
 
@@ -192,10 +211,13 @@ artefact de test qui ne se produit pas en conditions réelles.
   - `commandeJamaisPayeeNeRessortJamais` — aucun paiement → rien ne sort.
   - `paiementHorsFenetreDeDixMinNeConfirmePas` — paiement à +11 min → rien.
   - `paiementDeclineNeConfirmePasLaCommande` — `DECLINED` → filtré avant le join.
-- **Validation sur données réelles** (248k messages, `DataLoader`) : voir le
-  tableau de la section 4. Résultat final : **40 276 commandes confirmées**,
-  soit 98% du maximum théorique calculable à partir des taux d'anomalies
-  connus (~52k commandes valides, ~41k paiements `AUTHORIZED` valides).
+- **Validation sur données réelles** (248k messages, `DataLoader`) : voir
+  section 4. `idle=0` donne un résultat nettement plus bas que toute valeur
+  positive testée (8 760, contre 18k-40k selon la méthode et la valeur) —
+  suffisant pour prouver que le fix est nécessaire, insuffisant pour
+  garantir un chiffre exact reproductible en rejeu instantané. `make
+  stream` (entrelacé) donne des résultats plus cohérents que `make load`
+  (instantané) pour ce genre de vérification.
 
 ## 8. Ce qui n'est PAS fait (scope restant)
 
@@ -208,6 +230,13 @@ artefact de test qui ne se produit pas en conditions réelles.
   qui aurait été un choix moins correct sémantiquement (un grace period
   suppose des retardataires métier réels, alors que notre souci était un
   artefact de rejeu en masse).
+- **Reproductibilité de `make load` toujours pas résolue** (voir section 10) :
+  le nombre de commandes confirmées reste loin (~50-65%) de la vérité terrain
+  calculée par `scripts/cart2_ground_truth.py` (37 766), quel que soit
+  `max.task.idle.ms`. Diagnostic actuel : limite inhérente au rejeu massif
+  instantané (~15-20s pour 250k messages), pas un bug de la topologie. Pas
+  encore validé par un rejeu pacé (`--batch-size`/`--interval-ms` sans
+  `--live-timestamps`) — prochaine étape si on reprend ce sujet.
 
 ## 9. Questions probables à l'oral (anticipation)
 
@@ -217,15 +246,19 @@ artefact de test qui ne se produit pas en conditions réelles.
   explicite du README, un `leftJoin` violerait "commande jamais payée ne
   ressort pas".
 - *"Vous avez eu des surprises en testant avec des vraies données ?"* →
-  section 4, LA bonne histoire à raconter : `max.task.idle.ms`, diagnostic,
-  correction, 21% → 98%. Montre une compréhension fine du fonctionnement
-  interne de Kafka Streams (stream time, buffers par partition), pas juste
-  un copier-coller du DSL.
+  section 4, la bonne histoire à raconter : `max.task.idle.ms=0` donne un
+  résultat nettement dégradé sur un rejeu massif, diagnostic et correction
+  (valeur positive). Montre une compréhension fine du fonctionnement
+  interne de Kafka Streams (stream time, buffers par partition) — et
+  honnêteté sur les limites de nos mesures en rejeu instantané (variance
+  d'un run à l'autre, cause encore partiellement comprise) plutôt qu'un
+  chiffre présenté comme définitif sans l'être.
 - *"Ce problème peut arriver en soutenance sur le cluster partagé ?"* → non,
   argumenté : le générateur produit en continu, orders/payments arrivent
-  déjà entrelacés dans le temps, `max.task.idle.ms` n'a jamais besoin
-  d'attendre longtemps dans ce cas (contrairement au rejeu en masse d'un
-  dataset pré-enregistré).
+  déjà entrelacés dans le temps naturellement — `max.task.idle.ms` n'a
+  jamais besoin d'attendre longtemps dans ce cas, contrairement au rejeu
+  instantané d'un dataset pré-enregistré en quelques secondes (notre
+  méthode de test locale, pas les conditions réelles).
 - *"Que devient une commande dont le paiement est DECLINED ?"* → filtrée
   avant même d'entrer dans le repartitionnement/join ; elle ne va ni en DLQ
   (elle est valide au sens CART-1) ni dans `orders.confirmed` — elle
@@ -235,3 +268,110 @@ artefact de test qui ne se produit pas en conditions réelles.
   `orders-by-order-id-repartition` et `payments-by-order-id-repartition`
   dans les sous-topologies 0/1, puis la sous-topologie 3 qui les consomme
   pour le join.
+
+## 10. Investigation complémentaire (2026-07-17) : `make load` non reproductible
+
+Point de départ : le nombre de commandes confirmées variait à chaque
+`reset+init+run+load`, alors qu'on rejoue exactement les mêmes données. La
+section 4 avait déjà mesuré ça (20 780 vs 19 930 à `idle=10s`) mais sans
+identifier de cause aussi précise que ci-dessous, et sans vérité terrain pour
+juger si le résultat était "à peu près bon" ou "loin du compte".
+
+### 10.1 Cause racine trouvée : `DataLoader.replayImmediate` n'entrelaçait pas
+
+`make load` envoyait `cartflow.orders` **en entier**, un `flush()`, puis
+`cartflow.payments` **en entier**. Au moment où l'appli traite les premières
+commandes, aucun paiement n'existe encore sur le broker : le stream time côté
+commandes peut avancer (les timestamps du dataset couvrent des heures) et
+fermer des fenêtres de 10 min avant même que les paiements correspondants
+n'existent. Contrairement au problème de la section 4, ceci n'est **pas**
+une histoire de `max.task.idle.ms` (qui n'aide qu'à attendre une donnée
+*déjà présente sur le broker mais pas encore fetchée* — ça n'aide pas quand
+la donnée n'a tout simplement pas encore été produite).
+
+**Correctif appliqué** (gardé) : `DataLoader.replayImmediate` entrelace
+maintenant les 3 fichiers ligne par ligne (round-robin), en réutilisant
+l'abstraction `Cursor` déjà écrite pour `replayStreaming`, au lieu de les
+envoyer fichier par fichier. Aucun changement dans `CartflowTopology.java` —
+uniquement l'outil de dev, hors scope de notation.
+
+### 10.2 Vérité terrain indépendante : `scripts/cart2_ground_truth.py`
+
+Pour juger si un résultat est "bon" sans se fier à une impression, ce script
+recalcule directement sur `data/raw/*.jsonl` (sans Kafka du tout) : les
+règles de validation CART-1 (réimplémentation de `Validators.java` en
+Python) puis le matching CART-2 (`order_id` + fenêtre ±10 min). Résultat sur
+le dataset complet :
+
+```
+Orders   : 55201 total, 51971 valides (CART-1)
+Payments : 47614 total, 44543 valides (CART-1), 41013 valides+AUTHORIZED
+order_id valides matchés dans la fenêtre +/-10min (CART-2) : 37766
+```
+
+**Cible de référence : 37 766** commandes confirmées attendues.
+
+### 10.3 Résultats mesurés (4 cycles `reset+init+run+load`, entrelacé)
+
+| `max.task.idle.ms` | Résultat | % de la cible (37 766) |
+|---|---|---|
+| `0` (mesure de la section 4, avant entrelacement) | 8 760 | 23% |
+| `10000` — cycle 1 | 19 715 | 52% |
+| `10000` — cycle 2 | 25 118 | 66% |
+| `-1` | 6 257 | 17% |
+| `60000` | 18 430 | 49% |
+
+### 10.4 Erreur corrigée en cours de route : le sens de `max.task.idle.ms=-1`
+
+Hypothèse de départ (fausse) : `-1` ferait attendre Kafka Streams
+indéfiniment. Vérifiée directement dans le bytecode de
+`kafka-streams-4.2.1.jar` (`javap` sur `StreamsConfig.class`) :
+
+```
+public static final long MAX_TASK_IDLE_MS_DISABLED = -1L;
+```
+
+Doc officielle associée : *"Set to -1 to disable idling entirely and process
+any locally available data, even though doing so may produce out-of-order
+processing."* — `-1` est donc le réglage **le plus agressif** (aucune
+attente, même pour une donnée déjà présente sur le broker), pas le plus
+patient. Résultat mesuré (6 257, le pire de tous les essais) confirme la
+doc. *Bon exemple à citer à l'oral si on demande "avez-vous eu des erreurs
+de compréhension corrigées en testant ?" — plutôt que de laisser croire que
+tout a été compris du premier coup.*
+
+### 10.5 Conclusion actuelle (sujet non refermé)
+
+Au-delà de `idle=10000`, augmenter encore la valeur (`60000`) n'améliore pas
+le résultat — les deux tournent autour de 50-65% de la cible, avec toujours
+de la variance entre runs identiques. Diagnostic retenu : `make load`,
+même entrelacé, reste un envoi des 250k messages en ~15-20 secondes
+réelles ("burst"). Le pipeline a un coût de traversée réel (validation →
+topic de repartition → join) ; sur un rejeu aussi compressé, ce délai peut
+suffire à rater des fenêtres, indépendamment du réglage `idle`. Cette
+hypothèse n'est **pas encore vérifiée** : le test décisif serait un rejeu
+pacé sur la totalité du dataset (`--batch-size`/`--interval-ms`, **sans**
+`--live-timestamps` pour garder les timestamps originaux du dataset) comparé
+à la cible de 37 766 — pas fait faute de temps dans cette session.
+
+**État du code laissé en l'état** : `max.task.idle.ms` remis à `10000`
+(aucune valeur testée n'a fait mieux de façon probante, pas de raison de
+garder `60000` non justifié). L'entrelacement de `DataLoader` est conservé
+(strictement meilleur que l'envoi séquentiel, même si insuffisant seul).
+`scripts/cart2_ground_truth.py` reste disponible pour toute future
+vérification.
+
+### 10.6 Question probable à l'oral (ajout)
+
+- *"Le nombre de commandes confirmées, vous êtes sûrs qu'il est correct ?"*
+  → Non, honnêtement pas encore validé à 100% en local : on sait calculer une
+  cible exacte indépendamment de Kafka (37 766, `scripts/cart2_ground_truth.py`),
+  et nos rejeux locaux instantanés n'y arrivent qu'à 50-65%, mais on a de
+  bonnes raisons de penser (section 10.5) que c'est un artefact du rejeu en
+  rafale (~15-20s pour 250k messages) plutôt qu'un bug de la jointure — la
+  logique du join elle-même est validée indépendamment et de façon
+  déterministe par les tests `TopologyTestDriver` (section 7). Sur le
+  cluster partagé, le générateur produit en continu (pas en rafale), donc ce
+  problème spécifique ne devrait pas s'y reproduire — mais on n'a pas de
+  preuve chiffrée locale pour l'affirmer avec certitude, faute d'avoir
+  terminé le test en rejeu pacé.

@@ -124,26 +124,51 @@ public final class DataLoader {
         }
     }
 
-    /** Envoi immédiat, avec une limite facultative appliquée à chaque fichier. */
+    /**
+     * Envoi immédiat, mais entrelacé (une ligne de chaque fichier à tour de
+     * rôle) plutôt que fichier par fichier. Sans ça, orders.jsonl part en
+     * entier avant que payments.jsonl ne commence : le join fenêtré de
+     * CART-2 voit alors des paiements arriver bien après que les fenêtres
+     * de 10 min correspondantes se soient déjà fermées côté commandes
+     * (stream time), ce qui rend le nombre de commandes confirmées non
+     * reproductible d'un run à l'autre. L'entrelacement rapproche
+     * l'ordre d'envoi de ce que produit le générateur réel en continu.
+     */
     private static void replayImmediate(KafkaProducer<String, String> producer, Options options)
             throws IOException {
-        for (Source source : SOURCES) {
-            checkFile(source.file());
-            long sent = 0;
+        List<Cursor> cursors = openCursors();
 
-            try (BufferedReader reader = Files.newBufferedReader(source.file())) {
-                String line;
-                while ((line = nextLine(reader)) != null
-                        && (options.limit() == null || sent < options.limit())) {
-                    send(producer, source.topic(), line, options.liveTimestamps());
-                    sent++;
+        try {
+            boolean progressed = true;
+            while (progressed) {
+                progressed = false;
+                for (Cursor cursor : cursors) {
+                    if (!cursor.active()) {
+                        continue;
+                    }
+                    if (options.limit() != null && cursor.total() >= options.limit()) {
+                        cursor.finish();
+                        continue;
+                    }
+
+                    String line = nextLine(cursor.reader());
+                    if (line == null) {
+                        cursor.finish();
+                        continue;
+                    }
+
+                    send(producer, cursor.source().topic(), line, options.liveTimestamps());
+                    cursor.increment();
+                    progressed = true;
                 }
             }
-
-            producer.flush();
-            System.out.printf("%s -> %s : %d messages envoyes%n",
-                    source.file(), source.topic(), sent);
+        } finally {
+            closeCursors(cursors);
         }
+
+        producer.flush();
+        cursors.forEach(cursor -> System.out.printf("%s -> %s : %d messages envoyes%n",
+                cursor.source().file(), cursor.source().topic(), cursor.total()));
     }
 
     /**

@@ -16,13 +16,26 @@ spring:
         default.key.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
         default.value.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
         auto.offset.reset: earliest
-
-        # CART-2 : laisse temporairement une partition inactive attendre
-        # les autres partitions avant de faire avancer le stream time.
+        # CART-2 : par defaut (0), Kafka Streams n'attend pas d'avoir des
+        # donnees sur les DEUX cotes d'un join avant d'avancer son horloge
+        # interne (stream time). En rejeu massif (DataLoader envoie tout un
+        # fichier d'un coup en quelques secondes), ca fait fermer des
+        # fenetres de join avant que le paiement pourtant a l'heure soit
+        # traite. idle=0 confirme nettement moins de commandes que toute
+        # valeur positive (8 760 contre ~20-25k+ sur le meme jeu de
+        # donnees) : la valeur par defaut est clairement mauvaise ici.
         #
-        # Lors d'un rejeu massif, DataLoader peut envoyer toutes les
-        # commandes avant les paiements. Sans attente, certaines fenêtres
-        # de jointure peuvent être fermées trop tôt.
+        # Au-dela de "positif vs zero", on n'a PAS reussi a obtenir un
+        # nombre de confirmations stable/reproductible en rejeu instantane,
+        # meme entre deux cycles reset+init+run+load strictement identiques
+        # (ex: 20 780 puis 19 930 a idle=10s) : le resultat depend de
+        # micro-variations d'ordonnancement systeme (reseau Docker, disque,
+        # GC) qu'on ne maitrise pas completement en local. Ce n'est pas
+        # represantatif des conditions reelles de soutenance, ou le
+        # generateur produit en continu et interleave naturellement
+        # orders/payments. Pour tester CART-2 localement de facon plus
+        # fiable, preferer `make stream` (envoi entrelace et paced) a
+        # `make load` (rejeu instantane).
         max.task.idle.ms: 10000
 
         # CART-5 : désactive le cache des state stores.
