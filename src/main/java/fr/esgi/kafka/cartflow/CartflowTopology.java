@@ -92,38 +92,95 @@ public class CartflowTopology {
 
         // -----------------------------------------------------------------
         // CART-2 - Commandes confirmees -> Topics.ORDERS_CONFIRMED
-        //   Les deux flux sont cles par card_id ; le join se fait sur
-        //   order_id -> selectKey() obligatoire, ce qui declenche un
-        //   repartitionnement (visible dans topology.describe() plus bas).
-        //   On filtre les paiements AUTHORIZED avant de repartitionner
-        //   (inutile de repartitionner ce qu'on va jeter). Join INNER
-        //   (pas leftJoin) : une commande jamais payee ne doit jamais
-        //   ressortir. Fenetre 10 min, symetrique, sans grace pour commencer.
+        //
+        // Les deux flux arrivent initialement avec card_id comme clé.
+        // La jointure doit être faite sur order_id : on reclé puis on
+        // repartitionne explicitement.
+        //
+        // Seuls les paiements AUTHORIZED sont conservés.
+        //
+        // Fenêtre symétrique de 10 minutes :
+        // une commande et un paiement sont associés lorsque leurs timestamps
+        // Kafka diffèrent de 10 minutes maximum.
+        //
+        // Grâce de 1 minute :
+        // un événement appartenant à la fenêtre peut arriver jusqu'à une
+        // minute en retard par rapport au stream time.
         // -----------------------------------------------------------------
+
         KStream<String, Payment> authorizedPayments =
-                validPayments.filter((cardId, payment) -> "AUTHORIZED".equals(payment.status()));
+                validPayments.filter(
+                        (cardId, payment) ->
+                                "AUTHORIZED".equals(
+                                        payment.status()
+                                )
+                );
 
-        KStream<String, Order> ordersByOrderId = validOrders
-                .selectKey((cardId, order) -> order.orderId())
-                .repartition(Repartitioned.with(Serdes.String(), JsonSerdes.of(Order.class))
-                        .withName("orders-by-order-id"));
+        KStream<String, Order> ordersByOrderId =
+                validOrders
+                        .selectKey(
+                                (cardId, order) ->
+                                        order.orderId()
+                        )
+                        .repartition(
+                                Repartitioned.with(
+                                                Serdes.String(),
+                                                JsonSerdes.of(Order.class)
+                                        )
+                                        .withName(
+                                                "orders-by-order-id"
+                                        )
+                        );
 
-        KStream<String, Payment> paymentsByOrderId = authorizedPayments
-                .selectKey((cardId, payment) -> payment.orderId())
-                .repartition(Repartitioned.with(Serdes.String(), JsonSerdes.of(Payment.class))
-                        .withName("payments-by-order-id"));
+        KStream<String, Payment> paymentsByOrderId =
+                authorizedPayments
+                        .selectKey(
+                                (cardId, payment) ->
+                                        payment.orderId()
+                        )
+                        .repartition(
+                                Repartitioned.with(
+                                                Serdes.String(),
+                                                JsonSerdes.of(Payment.class)
+                                        )
+                                        .withName(
+                                                "payments-by-order-id"
+                                        )
+                        );
 
-        KStream<String, OrderConfirmed> confirmedOrders = ordersByOrderId.join(
-                paymentsByOrderId,
-                OrderConfirmed::new,
-                JoinWindows.ofTimeDifferenceWithNoGrace(Duration.ofMinutes(10)),
-                StreamJoined.<String, Order, Payment>as("orders-payments-join")
-                        .withKeySerde(Serdes.String())
-                        .withValueSerde(JsonSerdes.of(Order.class))
-                        .withOtherValueSerde(JsonSerdes.of(Payment.class)));
+        KStream<String, OrderConfirmed> confirmedOrders =
+                ordersByOrderId.join(
+                        paymentsByOrderId,
 
-        confirmedOrders.to(Topics.ORDERS_CONFIRMED,
-                Produced.with(Serdes.String(), JsonSerdes.of(OrderConfirmed.class)));
+                        OrderConfirmed::new,
+
+                        JoinWindows.ofTimeDifferenceAndGrace(
+                                Duration.ofMinutes(10),
+                                Duration.ofMinutes(5)
+                        ),
+
+                        StreamJoined
+                                .<String, Order, Payment>as(
+                                        "orders-payments-join"
+                                )
+                                .withKeySerde(
+                                        Serdes.String()
+                                )
+                                .withValueSerde(
+                                        JsonSerdes.of(Order.class)
+                                )
+                                .withOtherValueSerde(
+                                        JsonSerdes.of(Payment.class)
+                                )
+                );
+
+        confirmedOrders.to(
+                Topics.ORDERS_CONFIRMED,
+                Produced.with(
+                        Serdes.String(),
+                        JsonSerdes.of(OrderConfirmed.class)
+                )
+        );
 
         // CART-3 - CA par categorie (tumbling 1 min)   -> Topics.REVENUE_BY_CATEGORY
         // CART-4 - Detection de fraude carte           -> Topics.ALERTS_FRAUD
@@ -151,10 +208,10 @@ public class CartflowTopology {
                                 )
                         )
                         .windowedBy(
-                                SlidingWindows
-                                        .ofTimeDifferenceWithNoGrace(
-                                                Duration.ofMinutes(5)
-                                        )
+                                SlidingWindows.ofTimeDifferenceAndGrace(
+                                        Duration.ofMinutes(5),
+                                        Duration.ofMinutes(5)
+                                )
                         )
                         .aggregate(
                                 FraudStats::empty,
