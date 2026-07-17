@@ -171,4 +171,5 @@ down:
 reset:
 	docker compose down -v --remove-orphans
 	mvn -q clean
-	@echo "Reset complet : volumes, topics, messages et target supprimes."
+	@rm -rf "$$TEMP/kafka-streams/cartflow-$(GROUPE)"
+	@echo "Reset complet : volumes, topics, messages, target et etat RocksDB local supprimes."

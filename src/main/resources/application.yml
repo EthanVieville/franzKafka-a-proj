@@ -12,12 +12,23 @@ spring:
         # CART-2 : par defaut (0), Kafka Streams n'attend pas d'avoir des
         # donnees sur les DEUX cotes d'un join avant d'avancer son horloge
         # interne (stream time). En rejeu massif (DataLoader envoie tout un
-        # fichier d'un coup), ca fait fermer des fenetres de join avant que
-        # le paiement pourtant a l'heure soit traite - teste jusqu'a 21% de
-        # commandes confirmees en trop peu (idle=0) contre 98% (idle=60s).
-        # En flux reel continu (generateur du prof), ce n'est pas necessaire
-        # (orders/payments arrivent deja entrelaces) ; on garde une valeur
-        # raisonnable pour rester correct sans latence excessive.
+        # fichier d'un coup en quelques secondes), ca fait fermer des
+        # fenetres de join avant que le paiement pourtant a l'heure soit
+        # traite. idle=0 confirme nettement moins de commandes que toute
+        # valeur positive (8 760 contre ~20-25k+ sur le meme jeu de
+        # donnees) : la valeur par defaut est clairement mauvaise ici.
+        #
+        # Au-dela de "positif vs zero", on n'a PAS reussi a obtenir un
+        # nombre de confirmations stable/reproductible en rejeu instantane,
+        # meme entre deux cycles reset+init+run+load strictement identiques
+        # (ex: 20 780 puis 19 930 a idle=10s) : le resultat depend de
+        # micro-variations d'ordonnancement systeme (reseau Docker, disque,
+        # GC) qu'on ne maitrise pas completement en local. Ce n'est pas
+        # represantatif des conditions reelles de soutenance, ou le
+        # generateur produit en continu et interleave naturellement
+        # orders/payments. Pour tester CART-2 localement de facon plus
+        # fiable, preferer `make stream` (envoi entrelace et paced) a
+        # `make load` (rejeu instantane).
         max.task.idle.ms: 10000
         # Bonus fiabilite (CART-6) :
         # processing.guarantee: exactly_once_v2
