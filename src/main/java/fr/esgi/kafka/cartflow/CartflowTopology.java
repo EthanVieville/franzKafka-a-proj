@@ -8,6 +8,8 @@ import fr.esgi.kafka.cartflow.model.Payment;
 import fr.esgi.kafka.cartflow.model.StockMovement;
 import fr.esgi.kafka.cartflow.validation.ValidationResult;
 import fr.esgi.kafka.cartflow.validation.Validators;
+import fr.esgi.kafka.cartflow.model.FraudAlert;
+import fr.esgi.kafka.cartflow.model.FraudStats;
 
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsBuilder;
@@ -19,6 +21,13 @@ import org.apache.kafka.streams.kstream.Named;
 import org.apache.kafka.streams.kstream.Produced;
 import org.apache.kafka.streams.kstream.Repartitioned;
 import org.apache.kafka.streams.kstream.StreamJoined;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.kstream.Grouped;
+import org.apache.kafka.streams.kstream.KTable;
+import org.apache.kafka.streams.kstream.Materialized;
+import org.apache.kafka.streams.kstream.SlidingWindows;
+import org.apache.kafka.streams.kstream.Windowed;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
@@ -109,6 +118,79 @@ public class CartflowTopology {
 
         // CART-3 - CA par categorie (tumbling 1 min)   -> Topics.REVENUE_BY_CATEGORY
         // CART-4 - Detection de fraude carte           -> Topics.ALERTS_FRAUD
+        //
+        // Alerte lorsqu'une carte effectue au moins trois commandes dans
+        // une période glissante de cinq minutes, avec au moins deux villes
+        // de livraison différentes.
+        //
+        // Source : commandes confirmées de CART-2.
+        // Clé de regroupement : card_id.
+        // -----------------------------------------------------------------
+
+        KStream<String, OrderConfirmed> confirmedByCard =
+                confirmedOrders.selectKey(
+                        (orderId, confirmed) ->
+                                confirmed.order().cardId()
+                );
+
+        KTable<Windowed<String>, FraudStats> fraudWindows =
+                confirmedByCard
+                        .groupByKey(
+                                Grouped.with(
+                                        Serdes.String(),
+                                        JsonSerdes.of(OrderConfirmed.class)
+                                )
+                        )
+                        .windowedBy(
+                                SlidingWindows
+                                        .ofTimeDifferenceWithNoGrace(
+                                                Duration.ofMinutes(5)
+                                        )
+                        )
+                        .aggregate(
+                                FraudStats::empty,
+
+                                (cardId, confirmed, stats) ->
+                                        stats.add(
+                                                confirmed.order()
+                                                        .shippingCity()
+                                        ),
+
+                                Named.as("fraud-by-card"),
+
+                                Materialized.with(
+                                        Serdes.String(),
+                                        JsonSerdes.of(FraudStats.class)
+                                )
+                        );
+
+        fraudWindows
+                .toStream()
+                .filter(
+                        (windowedCard, stats) ->
+                                stats != null
+                                        && stats.isFraud()
+                )
+                .map(
+                        (windowedCard, stats) ->
+                                KeyValue.pair(
+                                        windowedCard.key(),
+                                        new FraudAlert(
+                                                windowedCard.key(),
+                                                stats.orderCount(),
+                                                stats.cities(),
+                                                windowedCard.window().start(),
+                                                windowedCard.window().end()
+                                        )
+                                )
+                )
+                .to(
+                        Topics.ALERTS_FRAUD,
+                        Produced.with(
+                                Serdes.String(),
+                                JsonSerdes.of(FraudAlert.class)
+                        )
+                );
         // CART-5 - Stock courant + alerte rupture      -> Topics.STOCK_LEVELS
         //                                                 et Topics.ALERTS_STOCK
         // CART-6 (bonus) - exactly_once_v2 + demonstration (cf. README)

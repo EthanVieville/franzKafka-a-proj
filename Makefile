@@ -51,6 +51,9 @@ help:
 	@echo "  make confirmed"
 	@echo "      Affiche les 20 premiers messages de orders.confirmed."
 	@echo ""
+	@echo "  make fraud"
+	@echo "      Affiche les alertes de fraude."
+	@echo ""
 	@echo "  make reset"
 	@echo "      Supprime le cluster, les volumes et le dossier target."
 
@@ -160,7 +163,18 @@ confirmed:
 		--timeout-ms 15000 \
 		--property print.key=true 2>&1 | \
 		grep -v "^\["
-
+		
+fraud:
+	@echo "(20 premieres alertes de fraude)"
+	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
+		/opt/kafka/bin/kafka-console-consumer.sh \
+		--bootstrap-server localhost:9092 \
+		--topic $(GROUPE).cartflow.alerts.fraud \
+		--from-beginning \
+		--max-messages 20 \
+		--timeout-ms 15000 \
+		--property print.key=true 2>&1 | \
+		grep -v "^\["
 ## ---------------------------------------------------------------------------
 ## Nettoyage
 ## ---------------------------------------------------------------------------
