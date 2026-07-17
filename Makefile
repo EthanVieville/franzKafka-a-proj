@@ -54,6 +54,12 @@ help:
 	@echo "  make fraud"
 	@echo "      Affiche les alertes de fraude."
 	@echo ""
+	@echo "  make stock"
+	@echo "      Affiche les 20 premieres mises a jour des niveaux de stock."
+	@echo ""
+	@echo "  make alerts-stock"
+	@echo "      Affiche les 20 premieres alertes de rupture."
+	@echo ""
 	@echo "  make reset"
 	@echo "      Supprime le cluster, les volumes et le dossier target."
 
@@ -163,7 +169,7 @@ confirmed:
 		--timeout-ms 15000 \
 		--property print.key=true 2>&1 | \
 		grep -v "^\["
-		
+
 fraud:
 	@echo "(20 premieres alertes de fraude)"
 	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
@@ -175,6 +181,24 @@ fraud:
 		--timeout-ms 15000 \
 		--property print.key=true 2>&1 | \
 		grep -v "^\["
+
+stock:
+	@echo "(20 premieres mises a jour des niveaux de stock)"
+	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
+		/opt/kafka/bin/kafka-console-consumer.sh \
+		--bootstrap-server localhost:9092 \
+		--topic $(GROUPE).cartflow.stock.levels \
+		--from-beginning --max-messages 20 --timeout-ms 15000 \
+		--property print.key=true 2>&1 | grep -v "^\["
+
+alerts-stock:
+	@echo "(20 premieres alertes de rupture)"
+	@MSYS_NO_PATHCONV=1 docker exec kafka-1 \
+		/opt/kafka/bin/kafka-console-consumer.sh \
+		--bootstrap-server localhost:9092 \
+		--topic $(GROUPE).cartflow.alerts.stock \
+		--from-beginning --max-messages 20 --timeout-ms 15000 \
+		--property print.key=true 2>&1 | grep -v "^\["
 ## ---------------------------------------------------------------------------
 ## Nettoyage
 ## ---------------------------------------------------------------------------
