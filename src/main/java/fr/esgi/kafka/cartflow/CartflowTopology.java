@@ -1,7 +1,10 @@
 package fr.esgi.kafka.cartflow;
 
 import fr.esgi.kafka.cartflow.common.JsonSerdes;
+import fr.esgi.kafka.cartflow.model.CategoryRevenue;
 import fr.esgi.kafka.cartflow.model.DlqMessage;
+import fr.esgi.kafka.cartflow.model.FraudAlert;
+import fr.esgi.kafka.cartflow.model.FraudStats;
 import fr.esgi.kafka.cartflow.model.Order;
 import fr.esgi.kafka.cartflow.model.OrderConfirmed;
 import fr.esgi.kafka.cartflow.model.Payment;
@@ -11,31 +14,24 @@ import fr.esgi.kafka.cartflow.model.StockMovement;
 import fr.esgi.kafka.cartflow.model.StockState;
 import fr.esgi.kafka.cartflow.validation.ValidationResult;
 import fr.esgi.kafka.cartflow.validation.Validators;
-import fr.esgi.kafka.cartflow.model.FraudAlert;
-import fr.esgi.kafka.cartflow.model.FraudStats;
-import fr.esgi.kafka.cartflow.model.StockAlert;
-import fr.esgi.kafka.cartflow.model.StockLevel;
-import fr.esgi.kafka.cartflow.model.StockState;
 
 import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.Branched;
 import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.kstream.Grouped;
 import org.apache.kafka.streams.kstream.JoinWindows;
 import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.kstream.KTable;
+import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Named;
 import org.apache.kafka.streams.kstream.Produced;
 import org.apache.kafka.streams.kstream.Repartitioned;
-import org.apache.kafka.streams.kstream.StreamJoined;
-import org.apache.kafka.streams.KeyValue;
-import org.apache.kafka.streams.kstream.Grouped;
-import org.apache.kafka.streams.kstream.KTable;
-import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.SlidingWindows;
+import org.apache.kafka.streams.kstream.StreamJoined;
+import org.apache.kafka.streams.kstream.TimeWindows;
 import org.apache.kafka.streams.kstream.Windowed;
-import org.apache.kafka.streams.kstream.Grouped;
-import org.apache.kafka.streams.kstream.KTable;
-import org.apache.kafka.streams.kstream.Materialized;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -125,7 +121,50 @@ public class CartflowTopology {
         confirmedOrders.to(Topics.ORDERS_CONFIRMED,
                 Produced.with(Serdes.String(), JsonSerdes.of(OrderConfirmed.class)));
 
-        // CART-3 - CA par categorie (tumbling 1 min)   -> Topics.REVENUE_BY_CATEGORY
+        // -----------------------------------------------------------------
+        // CART-3 - CA par categorie -> Topics.REVENUE_BY_CATEGORY
+        //   Source : commandes brutes valides (CART-1), pas les commandes
+        //   confirmees de CART-2 - choix assume : le CA est disponible
+        //   immediatement (pas d'attente du join sur le paiement), au prix
+        //   de compter aussi les ~12% de commandes jamais payees (a
+        //   defendre a l'oral comme un choix, pas un oubli).
+        //   flatMap "eclate" chaque commande en une ligne par item (une
+        //   commande peut contenir plusieurs categories) ; le flatMap
+        //   change la cle (card_id -> category), donc Kafka Streams insere
+        //   automatiquement un repartitionnement avant l'aggregation
+        //   (meme mecanisme implicite que pour confirmedByCard en CART-4,
+        //   pas besoin de repartition() explicite ici).
+        //   Fenetre tumbling 1 min (blocs fixes, non chevauchants -
+        //   different du SlidingWindows de CART-4) ; emission en continu
+        //   (pas de suppress()), coherent avec la publication continue du
+        //   stock en CART-5 : chaque commande met a jour le total de sa
+        //   fenetre et le republie aussitot.
+        // -----------------------------------------------------------------
+        KStream<String, Double> categoryRevenueLines = validOrders
+                .flatMap((cardId, order) -> order.items().stream()
+                        .map(item -> KeyValue.pair(
+                                item.category(),
+                                item.qty() * item.unitPrice()))
+                        .toList());
+
+        KTable<Windowed<String>, Double> revenueByCategory = categoryRevenueLines
+                .groupByKey(Grouped.with(Serdes.String(), Serdes.Double()))
+                .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(1)))
+                .reduce(Double::sum,
+                        Named.as("revenue-by-category"),
+                        Materialized.with(Serdes.String(), Serdes.Double()));
+
+        revenueByCategory.toStream()
+                .map((windowedCategory, revenue) -> KeyValue.pair(
+                        windowedCategory.key(),
+                        new CategoryRevenue(
+                                windowedCategory.key(),
+                                windowedCategory.window().start(),
+                                windowedCategory.window().end(),
+                                revenue)))
+                .to(Topics.REVENUE_BY_CATEGORY,
+                        Produced.with(Serdes.String(), JsonSerdes.of(CategoryRevenue.class)));
+
         // CART-4 - Detection de fraude carte           -> Topics.ALERTS_FRAUD
         //
         // Alerte lorsqu'une carte effectue au moins trois commandes dans

@@ -106,6 +106,10 @@ public final class DataLoader {
         SOURCES.forEach(source -> wanted.add(source.topic()));
         wanted.add(Topics.DLQ);
         wanted.add(Topics.ORDERS_CONFIRMED);
+        wanted.add(Topics.REVENUE_BY_CATEGORY);
+        wanted.add(Topics.ALERTS_FRAUD);
+        wanted.add(Topics.STOCK_LEVELS);
+        wanted.add(Topics.ALERTS_STOCK);
 
         try (AdminClient admin = AdminClient.create(properties)) {
             Set<String> existing = admin.listTopics().names().get();
