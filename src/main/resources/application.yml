@@ -1,10 +1,17 @@
 spring:
   application:
     name: cartflow
+
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
+
     streams:
       application-id: cartflow-${GROUPE:grp00}
+
+      # Place les états locaux Kafka Streams dans target/.
+      # Ils seront ainsi supprimés automatiquement par "mvn clean".
+      state-dir: ${KAFKA_STREAMS_STATE_DIR:target/kafka-streams}
+
       properties:
         default.key.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
         default.value.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
@@ -30,6 +37,19 @@ spring:
         # fiable, preferer `make stream` (envoi entrelace et paced) a
         # `make load` (rejeu instantane).
         max.task.idle.ms: 10000
+
+        # CART-5 : désactive le cache des state stores.
+        #
+        # Une KTable peut compacter plusieurs modifications successives
+        # d'une même clé avant de les transmettre en aval. Une valeur à 9
+        # suivie rapidement d'une valeur à 7 pourrait alors être réduite à
+        # la dernière mise à jour.
+        #
+        # La valeur 0 garantit :
+        # - la publication continue des niveaux de stock ;
+        # - la détection du passage exact de >= 10 vers < 10.
+        statestore.cache.max.bytes: 0
+
         # Bonus fiabilite (CART-6) :
         # processing.guarantee: exactly_once_v2
 

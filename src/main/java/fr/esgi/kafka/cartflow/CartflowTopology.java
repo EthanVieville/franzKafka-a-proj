@@ -5,9 +5,17 @@ import fr.esgi.kafka.cartflow.model.DlqMessage;
 import fr.esgi.kafka.cartflow.model.Order;
 import fr.esgi.kafka.cartflow.model.OrderConfirmed;
 import fr.esgi.kafka.cartflow.model.Payment;
+import fr.esgi.kafka.cartflow.model.StockAlert;
+import fr.esgi.kafka.cartflow.model.StockLevel;
 import fr.esgi.kafka.cartflow.model.StockMovement;
+import fr.esgi.kafka.cartflow.model.StockState;
 import fr.esgi.kafka.cartflow.validation.ValidationResult;
 import fr.esgi.kafka.cartflow.validation.Validators;
+import fr.esgi.kafka.cartflow.model.FraudAlert;
+import fr.esgi.kafka.cartflow.model.FraudStats;
+import fr.esgi.kafka.cartflow.model.StockAlert;
+import fr.esgi.kafka.cartflow.model.StockLevel;
+import fr.esgi.kafka.cartflow.model.StockState;
 
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsBuilder;
@@ -19,6 +27,16 @@ import org.apache.kafka.streams.kstream.Named;
 import org.apache.kafka.streams.kstream.Produced;
 import org.apache.kafka.streams.kstream.Repartitioned;
 import org.apache.kafka.streams.kstream.StreamJoined;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.kstream.Grouped;
+import org.apache.kafka.streams.kstream.KTable;
+import org.apache.kafka.streams.kstream.Materialized;
+import org.apache.kafka.streams.kstream.SlidingWindows;
+import org.apache.kafka.streams.kstream.Windowed;
+import org.apache.kafka.streams.kstream.Grouped;
+import org.apache.kafka.streams.kstream.KTable;
+import org.apache.kafka.streams.kstream.Materialized;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
@@ -109,8 +127,115 @@ public class CartflowTopology {
 
         // CART-3 - CA par categorie (tumbling 1 min)   -> Topics.REVENUE_BY_CATEGORY
         // CART-4 - Detection de fraude carte           -> Topics.ALERTS_FRAUD
-        // CART-5 - Stock courant + alerte rupture      -> Topics.STOCK_LEVELS
-        //                                                 et Topics.ALERTS_STOCK
+        //
+        // Alerte lorsqu'une carte effectue au moins trois commandes dans
+        // une période glissante de cinq minutes, avec au moins deux villes
+        // de livraison différentes.
+        //
+        // Source : commandes confirmées de CART-2.
+        // Clé de regroupement : card_id.
+        // -----------------------------------------------------------------
+
+        KStream<String, OrderConfirmed> confirmedByCard =
+                confirmedOrders.selectKey(
+                        (orderId, confirmed) ->
+                                confirmed.order().cardId()
+                );
+
+        KTable<Windowed<String>, FraudStats> fraudWindows =
+                confirmedByCard
+                        .groupByKey(
+                                Grouped.with(
+                                        Serdes.String(),
+                                        JsonSerdes.of(OrderConfirmed.class)
+                                )
+                        )
+                        .windowedBy(
+                                SlidingWindows
+                                        .ofTimeDifferenceWithNoGrace(
+                                                Duration.ofMinutes(5)
+                                        )
+                        )
+                        .aggregate(
+                                FraudStats::empty,
+
+                                (cardId, confirmed, stats) ->
+                                        stats.add(
+                                                confirmed.order()
+                                                        .shippingCity()
+                                        ),
+
+                                Named.as("fraud-by-card"),
+
+                                Materialized.with(
+                                        Serdes.String(),
+                                        JsonSerdes.of(FraudStats.class)
+                                )
+                        );
+
+        fraudWindows
+                .toStream()
+                .filter(
+                        (windowedCard, stats) ->
+                                stats != null
+                                        && stats.isFraud()
+                )
+                .map(
+                        (windowedCard, stats) ->
+                                KeyValue.pair(
+                                        windowedCard.key(),
+                                        new FraudAlert(
+                                                windowedCard.key(),
+                                                stats.orderCount(),
+                                                stats.cities(),
+                                                windowedCard.window().start(),
+                                                windowedCard.window().end()
+                                        )
+                                )
+                )
+                .to(
+                        Topics.ALERTS_FRAUD,
+                        Produced.with(
+                                Serdes.String(),
+                                JsonSerdes.of(FraudAlert.class)
+                        )
+                );
+        // -----------------------------------------------------------------
+        // CART-5 - Stock courant et alerte de rupture
+        //   Stock initial : 100 pour chaque SKU rencontré.
+        //   Chaque delta est ajouté au niveau courant.
+        //   Une alerte est produite uniquement lors du passage de >= 10 à < 10.
+        // -----------------------------------------------------------------
+        final int stockAlertThreshold = 10;
+
+        KTable<String, StockState> stockStates = validStock
+                .selectKey((inputKey, movement) -> movement.sku())
+                .groupByKey(Grouped.with(
+                        Serdes.String(),
+                        JsonSerdes.of(StockMovement.class)))
+                .aggregate(
+                        StockState::initial,
+                        (sku, movement, state) -> state.apply(movement.delta()),
+                        Named.as("stock-by-sku"),
+                        Materialized.with(
+                                Serdes.String(),
+                                JsonSerdes.of(StockState.class)));
+
+        // Publication continue du niveau après chaque mouvement.
+        stockStates.toStream()
+                .mapValues((sku, state) -> new StockLevel(sku, state.currentLevel()))
+                .to(Topics.STOCK_LEVELS,
+                        Produced.with(Serdes.String(), JsonSerdes.of(StockLevel.class)));
+
+        // Publication uniquement au moment du franchissement du seuil.
+        stockStates.toStream()
+                .filter((sku, state) -> state.crossedBelow(stockAlertThreshold))
+                .mapValues((sku, state) -> new StockAlert(
+                        sku,
+                        state.currentLevel(),
+                        stockAlertThreshold))
+                .to(Topics.ALERTS_STOCK,
+                        Produced.with(Serdes.String(), JsonSerdes.of(StockAlert.class)));
         // CART-6 (bonus) - exactly_once_v2 + demonstration (cf. README)
 
         LOG.info("Topologie construite :\n{}", builder.build().describe());
